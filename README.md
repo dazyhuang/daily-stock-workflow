@@ -1,5 +1,7 @@
 # Daily Stock Workflow
 
+[中文文档](README.zh-CN.md)
+
 An experimental A-share stock-selection workflow that combines market data,
 news/context collection, multi-factor LLM scoring, backtesting, intraday
 execution helpers, and weekly review loops.
