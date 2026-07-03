@@ -1,0 +1,17 @@
+{
+  "position_size_pct": 0.15,
+  "max_positions": 5,
+  "stop_loss_pct": -0.03,
+  "take_profit_1": 0.1,
+  "take_profit_2": 0.2,
+  "take_profit_3": 0.5,
+  "scoring_threshold": 65,
+  "hit_rate_threshold": 0.7,
+  "loss_rate_threshold": 0.4,
+  "momentum_weeks": 3,
+  "bayesian_prior": 0.5,
+  "bayesian_strength": 4,
+  "pool_hit_rates": {},
+  "market_regime": "unknown",
+  "week_history": []
+}

@@ -1,0 +1,8 @@
+akshare
+backtrader
+langgraph
+numpy
+pandas
+pydantic
+requests
+typing_extensions

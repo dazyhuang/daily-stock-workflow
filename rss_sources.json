@@ -1,0 +1,58 @@
+{
+  "sources": [
+    {
+      "name": "东方财富",
+      "url": "https://feed.eastmoney.com/news.xml",
+      "category": "宏观",
+      "enabled": true
+    },
+    {
+      "name": "凤凰财经",
+      "url": "https://finance.ifeng.com/rss/finance.xml",
+      "category": "市场",
+      "enabled": true
+    },
+    {
+      "name": "新浪财经",
+      "url": "https://rss.sina.com.cn/news/china/focus15.xml",
+      "category": "热点",
+      "enabled": true
+    },
+    {
+      "name": "英为财情",
+      "url": "https://www.investing.com/rss/news.rss",
+      "category": "全球",
+      "enabled": true
+    },
+    {
+      "name": "雪球精选",
+      "url": "https://xueqiu.com/hots/total.rss",
+      "category": "社区",
+      "enabled": false
+    },
+    {
+      "name": "证券时报",
+      "url": "https://www.stcn.com/rss/tougao.html",
+      "category": "A股",
+      "enabled": false
+    },
+    {
+      "name": "上海证券报",
+      "url": "https://www.cnstock.com/rss/newslist.php",
+      "category": "公告",
+      "enabled": false
+    },
+    {
+      "name": "财新网",
+      "url": "https://feed.caixin.com/rss.html",
+      "category": "宏观",
+      "enabled": false
+    },
+    {
+      "name": "第一财经",
+      "url": "https://www.yicai.com/rss/news.html",
+      "category": "市场",
+      "enabled": false
+    }
+  ]
+}

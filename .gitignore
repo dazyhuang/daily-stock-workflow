@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+*.bak
+*.bak.*
+*.backup
+*.backup_*
+*.log
+.env
+.venv/
+venv/
+*.sqlite
+*.db
+*.csv
+*.xlsx
+*.xls
+
+# Runtime output is kept locally and should not grow the source tree.
+logs/
+output/
+stock_selection_debate/output/
+runtime_archive/
+knowledge-base/*.json
+weekly_strategy/checkpoints/*.json
+
+# Local editor / OS noise.
+.DS_Store
+.ruff_cache/
