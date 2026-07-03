@@ -10,6 +10,19 @@ This repository is a sanitized public version. Runtime reports, logs, account
 state, broker exports, API keys, webhook URLs, and local machine paths are not
 included.
 
+## Workflow
+
+```mermaid
+flowchart LR
+    A[Market and news context] --> B[Candidate pool]
+    B --> C[LLM debate and scoring]
+    C --> D[Backtest validation]
+    D --> E[Daily report]
+    E --> F[Intraday dry-run helpers]
+    F --> G[Weekly review and attribution]
+    G --> B
+```
+
 ## What It Does
 
 - Phase 1: collect market, news, technical, fundamental, and sentiment context.
@@ -26,6 +39,12 @@ independent validation.
 
 Nothing in this project is financial advice. Use it as research code.
 
+## Who It Is For
+
+- Quant and retail-tooling researchers who want an end-to-end A-share workflow.
+- Python developers experimenting with LLM-assisted market research.
+- Builders who need a dry-run framework before connecting real data or broker APIs.
+
 ## Setup
 
 ```bash
@@ -37,6 +56,19 @@ cp .env.example .env
 
 Fill `.env` with your own provider keys and local data-bridge settings. Keep
 `.env` private.
+
+## Minimal Dry-Run Setup
+
+Start without real trading credentials:
+
+```bash
+cp .env.example .env
+printf '\nDRY_RUN=1\n' >> .env
+python3 workflow.py
+```
+
+Some data and LLM paths require provider keys. When a provider is not configured,
+expect the workflow to skip or degrade that part rather than perform live calls.
 
 ## Common Commands
 
@@ -63,6 +95,12 @@ python3 check_money_flow_quality.py --days 10
 python3 top5_review_attribution.py --days 10
 ```
 
+## Demo and Examples
+
+- [Demo walkthrough](docs/demo.md)
+- [Chinese launch article draft](docs/launch-article.zh-CN.md)
+- [Short social posts](docs/social-posts.zh-CN.md)
+
 ## Configuration
 
 Important environment variables are documented in `.env.example`.
@@ -88,3 +126,8 @@ Generated files stay local and are ignored by Git:
 ## License
 
 MIT
+
+## Contributing
+
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md)
+and [ROADMAP.md](ROADMAP.md) for the current direction.

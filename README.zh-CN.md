@@ -4,6 +4,19 @@
 
 这是经过清理的公开版本。仓库不包含真实运行报告、日志、账户状态、券商导出文件、API Key、Webhook 地址或本机路径。
 
+## 工作流
+
+```mermaid
+flowchart LR
+    A[市场和新闻情报] --> B[候选股票池]
+    B --> C[LLM 辩论和评分]
+    C --> D[回测验证]
+    D --> E[每日选股报告]
+    E --> F[盘中 dry-run 辅助]
+    F --> G[周度复盘和归因]
+    G --> B
+```
+
 ## 功能概览
 
 - Phase 1：收集市场、新闻、技术面、基本面和情绪信息。
@@ -18,6 +31,12 @@
 
 本项目不构成投资建议，仅用于研究和工程实验。
 
+## 适合谁使用
+
+- 想研究 A 股端到端选股流程的量化和工具开发者。
+- 想尝试 LLM 辅助市场研究的 Python 开发者。
+- 想先 dry-run 验证，再接入真实行情或券商接口的构建者。
+
 ## 安装
 
 ```bash
@@ -28,6 +47,18 @@ cp .env.example .env
 ```
 
 然后在 `.env` 中填入你自己的模型、数据源、通知和本地行情桥接配置。不要提交 `.env`。
+
+## 最小 dry-run 运行
+
+先不配置真实交易凭据：
+
+```bash
+cp .env.example .env
+printf '\nDRY_RUN=1\n' >> .env
+python3 workflow.py
+```
+
+部分数据源和 LLM 链路需要对应服务密钥。未配置时，工作流应跳过或降级相关环节，而不是执行真实调用。
 
 ## 常用命令
 
@@ -53,6 +84,12 @@ python3 check_money_flow_quality.py --days 10
 # Top5 归因复盘。
 python3 top5_review_attribution.py --days 10
 ```
+
+## Demo 和传播材料
+
+- [Demo 说明](docs/demo.md)
+- [中文发布文章草稿](docs/launch-article.zh-CN.md)
+- [短文案合集](docs/social-posts.zh-CN.md)
 
 ## 配置说明
 
@@ -87,3 +124,7 @@ python3 top5_review_attribution.py --days 10
 ## 许可证
 
 MIT
+
+## 参与贡献
+
+欢迎提交 Issue 和 Pull Request。当前方向见 [CONTRIBUTING.md](CONTRIBUTING.md) 和 [ROADMAP.md](ROADMAP.md)。
