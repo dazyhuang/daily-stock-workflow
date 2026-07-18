@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Dict, List, Any, Optional
 import logging
 
-logger = logging.getLogger("tech_scoring")
+logger = logging.getLogger("daily_stock_workflow.tech_scoring")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 维度1：蜡烛图形态（0-20分）
@@ -299,7 +299,9 @@ def score_ma_system(kline: List[Dict], packet: Dict) -> Dict:
     
     ind = packet.get("indicators", {})
     rsi = _safe_float(ind.get("rsi_14"), 50)
-    macd_signal = ind.get("macd_signal", "")  # "金叉"/"死叉"/""
+    macd_signal = ind.get("macd_signal", "")
+    macd_state = ind.get("macd_state", "")
+    macd_cross = ind.get("macd_cross_event", "")
     
     score = 7
     detail_parts = []
@@ -325,12 +327,12 @@ def score_ma_system(kline: List[Dict], packet: Dict) -> Dict:
         score += 2
         detail_parts.append("价格>MA5+2")
     
-    if macd_signal == "金叉":
+    if macd_cross == "金叉" or macd_state == "多头" or macd_signal in {"金叉", "多头区"}:
         score += 2
-        detail_parts.append("MACD金叉+2")
-    elif macd_signal == "死叉":
+        detail_parts.append("MACD多头/金叉+2")
+    elif macd_cross == "死叉" or macd_state == "空头" or macd_signal in {"死叉", "空头区"}:
         score -= 2
-        detail_parts.append("MACD死叉-2")
+        detail_parts.append("MACD空头/死叉-2")
     
     if rsi > 80:
         score -= 4

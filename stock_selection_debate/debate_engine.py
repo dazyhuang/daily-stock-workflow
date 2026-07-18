@@ -30,6 +30,7 @@ import urllib.error
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Annotated
 from typing_extensions import TypedDict
+from pm_schema_docs import pm_json_field_instructions, pm_text_field_instructions
 from dataclasses import dataclass, field
 
 from langgraph.graph import StateGraph, END
@@ -37,7 +38,7 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from .data_fetcher import build_debate_packet, load_phase1_cache
 
-logger = logging.getLogger("stock_selection_debate")
+logger = logging.getLogger("daily_stock_workflow.debate")
 
 # ── 修复：JsonPlusSerializer 的 msgpack 序列化器不处理 numpy 标量，
 #    导致 MemorySaver checkpoint 失败。patch _msgpack_default 解决。
@@ -71,27 +72,33 @@ SIGNAL_WATCH_THRESHOLD = 40
 
 # 技术形态分析师配置（环境变量可覆盖；基金经理裁决不走这组默认值）
 TECH_ANALYST_MODEL = os.environ.get("TECH_ANALYST_MODEL", "volcengine-plan/ark-code-latest")
-TECH_ANALYST_FALLBACK_MODEL = os.environ.get("TECH_ANALYST_FALLBACK_MODEL", "openai/gpt-5.5")
+TECH_ANALYST_FALLBACK_MODEL = os.environ.get("TECH_ANALYST_FALLBACK_MODEL", "openai/gpt-5.6-sol")
 TECH_ANALYST_TIMEOUT = 90
 
 # 基金经理裁决专用：
-# 1. GPT-5.5：主裁决，开启 high reasoning
-# 2. MiniMax M3：portal OAuth + adaptive thinking + structured JSON 兜底
-# 3. structured 全失败后才落到 MiniMax thinking 文本解析 / JSON repair
-# PM 级联：GPT-5.5(Reasoning+json_schema) → MiniMax M3(adaptive+JSON) → MiniMax text/repair
-PORTFOLIO_MANAGER_PRIMARY_MODEL = os.environ.get("PORTFOLIO_MANAGER_PRIMARY_MODEL", "openai/gpt-5.5")
-PORTFOLIO_MANAGER_GPT55_ENABLED = os.environ.get("PORTFOLIO_MANAGER_GPT55_ENABLED", "1") != "0"
-PORTFOLIO_MANAGER_GPT55_TIMEOUT = int(os.environ.get("PORTFOLIO_MANAGER_GPT55_TIMEOUT", "180"))
-PORTFOLIO_MANAGER_SECONDARY_MODEL = os.environ.get("PORTFOLIO_MANAGER_SECONDARY_MODEL", "minimax-portal/MiniMax-M3")
+# GPT-5.6 Sol(max) -> GPT-5.6 Sol(max) -> MiniMax M3(adaptive JSON) -> MiniMax text/repair
+PORTFOLIO_MANAGER_PRIMARY_MODEL = os.environ.get("PORTFOLIO_MANAGER_PRIMARY_MODEL", "openai/gpt-5.6-sol")
+PORTFOLIO_MANAGER_PRIMARY_ENABLED = os.environ.get(
+    "PORTFOLIO_MANAGER_PRIMARY_ENABLED",
+    os.environ.get("PORTFOLIO_MANAGER_SOL_ENABLED", "1"),
+) != "0"
+PORTFOLIO_MANAGER_PRIMARY_REASONING_EFFORT = os.environ.get("PORTFOLIO_MANAGER_PRIMARY_REASONING_EFFORT", "max")
+PORTFOLIO_MANAGER_TIMEOUT = int(os.environ.get(
+    "PORTFOLIO_MANAGER_TIMEOUT",
+    os.environ.get("PORTFOLIO_MANAGER_SOL_TIMEOUT", "300"),
+))
+PORTFOLIO_MANAGER_SECONDARY_MODEL = os.environ.get("PORTFOLIO_MANAGER_SECONDARY_MODEL", "openai/gpt-5.6-sol")
+PORTFOLIO_MANAGER_SECONDARY_REASONING_EFFORT = os.environ.get("PORTFOLIO_MANAGER_SECONDARY_REASONING_EFFORT", "max")
 PORTFOLIO_MANAGER_SECONDARY_FALLBACK_MODEL = os.environ.get("PORTFOLIO_MANAGER_SECONDARY_FALLBACK_MODEL", "")
-PORTFOLIO_MANAGER_MINIMAX_ENABLED = os.environ.get("PORTFOLIO_MANAGER_MINIMAX_ENABLED", "0") == "1"
+PORTFOLIO_MANAGER_TERTIARY_MODEL = os.environ.get("PORTFOLIO_MANAGER_TERTIARY_MODEL", "minimax-portal/MiniMax-M3")
+PORTFOLIO_MANAGER_MINIMAX_ENABLED = os.environ.get("PORTFOLIO_MANAGER_MINIMAX_ENABLED", "1") != "0"
 # MiniMax portal 只支持 off/adaptive；这里的非零预算映射为 adaptive。
 PORTFOLIO_MANAGER_MINIMAX_BUDGET = int(os.environ.get("PORTFOLIO_MANAGER_MINIMAX_BUDGET", "16000"))
 
-_pm_gpt55_lock = threading.Lock()
-_pm_gpt55_broken = False
-_pm_gpt55_failure_reason = ""
-_pm_gpt55_fallback_count = 0
+_pm_primary_lock = threading.Lock()
+_pm_primary_broken = False
+_pm_primary_failure_reason = ""
+_pm_primary_fallback_count = 0
 _secondary_broken = False
 _secondary_failure_reason = ""
 
@@ -111,6 +118,7 @@ from .providers import (
     DEFAULT_MODEL,
     MAX_DEBATE_ROUNDS,
     DEFAULT_TIMEOUT,
+    ROLE_MAX_TOKENS,
     THINKING_BUDGET_VOLCAN,
     THINKING_BUDGET_MINIMAX,
 )
@@ -128,7 +136,7 @@ def _call_role(
     user: str,
     model: str = DEFAULT_MODEL,
     timeout: int = 120,
-    max_tokens: int = 12000,
+    max_tokens: int = ROLE_MAX_TOKENS,
     actual_model_out: Optional[list] = None,
 ) -> str:
     """带备用机制的 LLM 调用：主模型失败自动切换备用模型。
@@ -191,12 +199,14 @@ def _signal_from_buy_score(buy_score: int) -> str:
 # ── Prompt 模板 ───────────────────────────────────────────
 
 SYSTEM_PROMPT = """你是一位客观、专业、数据驱动的A股分析师。你的所有判断必须基于提供的实际数据，不主观臆断，不编造数据。
-证据约束：只能使用数据包中 status=ok 的字段作为正面或负面论据；status=partial/missing/unknown 的字段只能写“无法验证”，不得据此推断。每个核心结论都要能对应到具体字段。输出要简洁、有条理、用数据说话。"""
+证据约束：只能使用数据包中 status=ok 的字段作为正面或负面论据；类别为 partial 时，仅可使用其 field_status=ok 的具体字段；missing/unknown 字段只能写“无法验证”，不得据此推断。每个核心结论都要能对应到具体字段。输出要简洁、有条理、用数据说话。"""
 
 # ── 辩论包渲染 ────────────────────────────────────────────
 
 def _contract_category_for_field(field: str) -> str:
     field = str(field or "")
+    if field.startswith("knowledge_rule") or field.startswith("verified_market_snapshot."):
+        return "kline"
     if field.startswith("money_flow."):
         return "money_flow"
     if field.startswith("kline_summary.") or field.startswith("indicators.") or field in {"kline_raw", "kline_count"}:
@@ -208,6 +218,14 @@ def _contract_category_for_field(field: str) -> str:
     if field.startswith("news"):
         return "news"
     return field.split(".", 1)[0] if field else "unknown"
+
+
+def _field_contract_status(packet: Dict[str, Any], field: str) -> str:
+    category = _contract_category_for_field(field)
+    item = ((packet.get("data_contract") or {}).get(category) or {})
+    field_status = item.get("field_status") or {}
+    short_field = field.split(".", 1)[1] if "." in field else field
+    return str(field_status.get(field) or field_status.get(short_field) or item.get("status") or "unknown")
 
 
 def _get_nested_value(data: Dict[str, Any], field: str):
@@ -241,6 +259,13 @@ def _render_data_contract(packet: Dict[str, Any]) -> str:
             extra.append(f"error={error}")
         if flags:
             extra.append(f"flags={flags}")
+        field_status = item.get("field_status") or {}
+        if field_status:
+            available = [name for name, value in field_status.items() if value == "ok"]
+            missing = [name for name, value in field_status.items() if value != "ok"]
+            extra.append(f"available_fields={','.join(available) or 'none'}")
+            if missing:
+                extra.append(f"missing_fields={','.join(missing)}")
         suffix = f" ({'; '.join(extra)})" if extra else ""
         lines.append(f"- {labels.get(key, key)}: status={status}, source={source}{suffix}")
     return "\n".join(lines)
@@ -252,19 +277,46 @@ def _available_evidence_fields(packet: Dict[str, Any]) -> str:
         "kline_summary.latest_close", "kline_summary.ma_system", "kline_summary.trend_pct_5d",
         "kline_summary.trend_pct_10d", "kline_summary.trend_pct_20d", "kline_summary.vol_5avg_vs_20avg",
         "kline_summary.vol_trend", "kline_summary.close_position_20d", "indicators.rsi_14",
-        "indicators.macd", "indicators.macd_signal", "money_flow.main_net_flow",
+        "indicators.macd", "indicators.macd_dea", "indicators.macd_hist", "indicators.macd_state",
+        "indicators.macd_cross_event", "money_flow.main_net_flow",
         "money_flow.super_net_flow", "money_flow.ddx_5", "money_flow.ddy_10",
         "financial.roe", "financial.revenue_growth", "financial.net_profit_growth",
         "financial.pe_ttm", "financial.pb", "sector",
+        "knowledge_rule_summary", "knowledge_rule_score_adjustment",
+        "verified_market_snapshot.latest_close", "verified_market_snapshot.trend_state",
+        "verified_market_snapshot.ma_alignment", "verified_market_snapshot.volume_ratio_5_20",
+        "verified_market_snapshot.rsi14", "verified_market_snapshot.macd.state",
+        "verified_market_snapshot.macd.cross_event",
+        "verified_market_snapshot.kdj.signal", "verified_market_snapshot.close_position_20d",
     ]
     refs = []
     for field in candidates:
-        category = _contract_category_for_field(field)
-        status = (contract.get(category) or {}).get("status")
+        status = _field_contract_status(packet, field)
         value, exists = _get_nested_value(packet, field)
-        if exists and not _is_missing_value(value) and (not status or status == "ok"):
+        if exists and not _is_missing_value(value) and status == "ok":
             refs.append(f"- {field} = {value}")
     return "\n".join(refs[:24]) if refs else "无可用证据字段；只能给低置信 WATCH/AVOID。"
+
+
+def _render_pm_knowledge_rules(packet: Dict[str, Any]) -> str:
+    hits = packet.get("knowledge_rule_hits") or []
+    summary = str(packet.get("knowledge_rule_summary") or "").strip()
+    if not hits and not summary:
+        return "未命中明确本地证券知识规则。"
+    lines = []
+    if summary:
+        lines.append(f"摘要: {summary}")
+    for item in hits[:5]:
+        try:
+            effect = float(item.get("effect") or 0)
+            effect_text = f"{effect:+.1f}"
+        except (TypeError, ValueError):
+            effect_text = str(item.get("effect") or "")
+        gate = "；需盘中确认" if item.get("watch_only") else ""
+        lines.append(
+            f"- {item.get('rule_id')}: {item.get('claim')} ({effect_text}{gate}; source={item.get('source')})"
+        )
+    return "\n".join(lines[:6])
 
 
 def _normalize_evidence_refs(value: Any) -> list[dict]:
@@ -292,6 +344,16 @@ _MISSING_CATEGORY_TERMS = {
 }
 
 _VALID_MISSING_DATA_CATEGORIES = {"kline", "money_flow", "financial", "sector", "news"}
+
+
+def _uses_missing_category_as_fact(text: str, terms: list[str]) -> bool:
+    for sentence in re.split(r"[。！？；;\n]", str(text or "")):
+        if not any(term in sentence for term in terms):
+            continue
+        if any(marker in sentence for marker in ("无法验证", "不可验证", "缺失", "不可用", "未提供", "无数据")):
+            continue
+        return True
+    return False
 
 
 def _normalize_missing_data_used(value: Any, packet: Dict[str, Any] | None = None) -> list[str]:
@@ -327,22 +389,30 @@ def _validate_pm_evidence(
     normalized_refs = _normalize_evidence_refs(evidence_refs)
 
     if not normalized_refs:
-        warnings.append("PM未返回evidence_refs")
+        errors.append("PM未返回evidence_refs")
 
     for ref in normalized_refs:
         field = ref.get("field", "")
-        category = _contract_category_for_field(field)
         value, exists = _get_nested_value(packet, field)
         if not exists or _is_missing_value(value):
             errors.append(f"证据字段不存在或为空: {field}")
             continue
-        if category in missing_categories:
+        if _field_contract_status(packet, field) != "ok":
             errors.append(f"证据字段属于缺失/部分缺失类别: {field}")
+            continue
+        claimed_value = ref.get("value")
+        if not _evidence_values_equal(value, claimed_value):
+            errors.append(f"证据值不一致: {field} 实际={value} 引用={claimed_value}")
+        if not str(ref.get("claim") or "").strip():
+            errors.append(f"证据缺少claim: {field}")
 
     reason_text = str(reason or "")
+    errors.extend(_role_evidence_errors(packet, reason_text))
     for category in missing_categories:
+        if str((contract.get(category) or {}).get("status") or "") == "partial":
+            continue
         terms = _MISSING_CATEGORY_TERMS.get(category, [])
-        if any(term in reason_text for term in terms):
+        if _uses_missing_category_as_fact(reason_text, terms):
             errors.append(f"理由疑似使用缺失数据类别: {category}")
 
     normalized_missing_data_used = _normalize_missing_data_used(missing_data_used, packet)
@@ -362,6 +432,728 @@ def _validate_pm_evidence(
         "missing_categories": sorted(missing_categories),
         "missing_data_used": normalized_missing_data_used,
     }
+
+
+def _evidence_values_equal(actual: Any, claimed: Any) -> bool:
+    if _is_missing_value(claimed):
+        return False
+    try:
+        actual_num = float(actual)
+        claimed_num = float(str(claimed).replace("%", "").strip())
+        tolerance = max(1e-4, abs(actual_num) * 0.005)
+        return abs(actual_num - claimed_num) <= tolerance
+    except (TypeError, ValueError):
+        return str(actual).strip().lower() == str(claimed).strip().lower()
+
+
+def _phrase_is_asserted(text: str, phrase: str) -> bool:
+    """Return True only when a phrase is stated as a current fact.
+
+    Research roles often mention an indicator in a negation or a future trigger,
+    such as "尚未形成MACD金叉" or "若MACD金叉再确认". Those are not factual
+    contradictions and must not poison the node checkpoint.
+    """
+    for sentence in re.split(r"[。！？；;\n]", str(text or "")):
+        start = 0
+        while True:
+            idx = sentence.find(phrase, start)
+            if idx < 0:
+                break
+            before = sentence[max(0, idx - 56):idx]
+            after = sentence[idx + len(phrase):idx + len(phrase) + 40]
+            negated_before = re.search(
+                r"(?:尚未|未见|未现|未形成|未发生|未触发|无新|无明显|无|没有|不存在|并非|不属于|不构成|不能确认|无法确认|暂无|等待|待)[^，,]{0,10}$",
+                before,
+            )
+            conditional_before = re.search(r"(?:若|如果|一旦|除非|只有)[^，,]{0,24}$", before)
+            negated_after = re.match(r"(?:尚未|未|并未|没有|并不|不成立|不明显|待确认|才|再)", after)
+            # Bull/Bear roles must quote and rebut each other.  A phrase inside
+            # "多方声称..." or "反驳空方观点..." is an attributed claim, not
+            # the current role asserting that technical state as fact.
+            attributed_before = re.search(
+                r"(?:多方|空方|对方|上一轮|前述|此前|原(?:观点|论点)|该(?:观点|论点)|所谓)"
+                r"[^，,]{0,28}(?:认为|声称|宣称|主张|提出|强调|判断|假设|称|观点|论点|说法)"
+                r"[^，,]{0,14}$",
+                before,
+            ) or re.search(
+                r"(?:反驳|质疑|否定)(?:多方|空方|对方)?[^，,]{0,18}$",
+                before,
+            )
+            refuted_after = re.match(
+                r"[”’\"']?\s*(?:(?:这一|该)?(?:说法|观点|论点|判断))?\s*"
+                r"(?:并?不成立|错误|不实|无法验证|未获验证|与实际[^，,]{0,12}不一致)",
+                after,
+            )
+            endorsed_after = re.match(
+                r"[”’\"']?\s*(?:(?:这一|该)?(?:说法|观点|论点|判断))?\s*"
+                r"(?:确实|明确|已经)?(?:成立|属实|得到确认|被数据证实)",
+                after,
+            )
+            if endorsed_after or not (
+                negated_before
+                or conditional_before
+                or negated_after
+                or attributed_before
+                or refuted_after
+            ):
+                return True
+            start = idx + len(phrase)
+    return False
+
+
+def _macd_event_is_asserted(text: str, event: str) -> bool:
+    """Recognize formatted MACD event claims such as 'MACD动量：金叉有效'."""
+    for sentence in re.split(r"[。！？；;\n]", str(text or "")):
+        for match in re.finditer(re.escape(event), sentence):
+            before = sentence[max(0, match.start() - 48):match.start()]
+            after = sentence[match.end():match.end() + 24]
+            macd_context = (
+                re.search(r"(?:MACD|DIF|DEA|零轴)[^，,]{0,30}$", before, flags=re.IGNORECASE)
+                or re.match(r"[^，,]{0,16}(?:MACD|DIF|DEA)", after, flags=re.IGNORECASE)
+            )
+            if macd_context and _phrase_is_asserted(sentence, event):
+                return True
+    return False
+
+
+def _ma_direct_claim_pattern(direction: str) -> re.Pattern:
+    """Match common compact MA-system claims emitted by different providers."""
+    compact = "多排" if direction == "多头" else "空排"
+    return re.compile(
+        rf"均线(?:系统)?\s*"
+        rf"(?:(?:当前|目前|整体|总体|结构|形态|走势)\s*)?"
+        rf"(?:[:：=]\s*)?"
+        rf"(?:(?:呈现?|为|是|处于|维持|保持|转为|形成|构成)\s*)?"
+        rf"(?:(?:明显|典型|标准|完整)\s*)?"
+        rf"(?:{re.escape(direction)}(?:排列|格局|趋势|形态|结构)?|{compact})"
+    )
+
+
+def _ma_arrangement_is_asserted(text: str, direction: str) -> bool:
+    """Recognize MA arrangement claims without confusing them with MACD wording."""
+    direct_pattern = _ma_direct_claim_pattern(direction)
+    phrase = f"{direction}排列"
+    ma_token = re.compile(r"MA(?:5|10|20|30|60|120|250)\b", flags=re.IGNORECASE)
+    for sentence in re.split(r"[。！？；;\n]", str(text or "")):
+        for match in direct_pattern.finditer(sentence):
+            if _phrase_is_asserted(sentence, match.group(0)):
+                return True
+        for match in re.finditer(re.escape(phrase), sentence):
+            before = sentence[max(0, match.start() - 56):match.start()]
+            if ("均线" in before or ma_token.search(before)) and _phrase_is_asserted(sentence, phrase):
+                return True
+    return False
+
+
+_MONEY_FLOW_INDEX_VALUE_RE = re.compile(
+    r"(?P<label>5日DDX|10日DDY|10日DDX|5日DDY)"
+    r"\s*(?:为|是|=|:|：)?\s*[（(]?\s*"
+    r"(?P<value>[+-]?\d+(?:\.\d+)?)",
+    flags=re.IGNORECASE,
+)
+_MONEY_FLOW_COMPOSITE_INDEX_RE = re.compile(
+    r"(?:5\s*[/／、]\s*10日|5日\s*[/／、]\s*10日)\s*"
+    r"(?:DDX|DDY)"
+    r"(?:\s*(?:为|是|=|:|：)?\s*[（(]?\s*[+-]?\d+(?:\.\d+)?\s*[）)]?)?"
+    r"(?:\s*[/／、]\s*(?:DDX|DDY)"
+    r"(?:\s*(?:为|是|=|:|：)?\s*[（(]?\s*[+-]?\d+(?:\.\d+)?\s*[）)]?)?"
+    r"(?:\s*(?:深度|明显)?\s*(?:正|负)?值)?)?",
+    flags=re.IGNORECASE,
+)
+_MONEY_FLOW_NET_VALUE_RE = re.compile(
+    r"(?P<horizon>(?:5|10)日)?\s*"
+    r"(?P<actor>主力(?:资金)?|超大单)(?:资金)?\s*(?:净)?\s*"
+    r"(?:(?:单日|当日|明显|大幅|持续)\s*){0,3}"
+    r"(?P<direction>流入|流出)"
+    r"\s*(?:为|是|=|:|：)?\s*[（(]?\s*"
+    r"(?P<value>[+-]?\d+(?:\.\d+)?)\s*(?:亿元|亿)",
+    flags=re.IGNORECASE,
+)
+_MONEY_FLOW_INDEX_FIELDS = {
+    "5日DDX": "ddx_5",
+    "10日DDY": "ddy_10",
+}
+_UNSUPPORTED_MONEY_FLOW_INDEX_FIELDS = {
+    "10日DDX": ("10日DDY", "ddy_10"),
+    "5日DDY": ("5日DDX", "ddx_5"),
+}
+
+
+def _money_flow_claim_tolerance(actual: float) -> float:
+    return max(0.01, abs(float(actual)) * 0.03)
+
+
+def _money_flow_net_field(match: re.Match) -> str:
+    horizon = str(match.group("horizon") or "")
+    actor = str(match.group("actor") or "")
+    if actor.startswith("主力"):
+        return {
+            "": "main_net_flow",
+            "5日": "main_net_flow_5d",
+            "10日": "main_net_flow_10d",
+        }.get(horizon, "")
+    return "super_net_flow" if not horizon else ""
+
+
+def _money_flow_evidence_errors(packet: Dict[str, Any], text: str) -> list[str]:
+    """Validate exact money-flow metric names and numeric claims."""
+    money_flow = packet.get("money_flow") or {}
+    errors: list[str] = []
+    for sentence in re.split(r"[。！？；;\n]", str(text or "")):
+        for match in _MONEY_FLOW_COMPOSITE_INDEX_RE.finditer(sentence):
+            if _phrase_is_asserted(sentence, match.group(0)):
+                errors.append("资金流复合指标写法不明确")
+
+        matched_labels: set[str] = set()
+        for match in _MONEY_FLOW_INDEX_VALUE_RE.finditer(sentence):
+            if not _phrase_is_asserted(sentence, match.group(0)):
+                continue
+            label = str(match.group("label") or "").upper().replace("日DD", "日DD")
+            matched_labels.add(label)
+            if label in _UNSUPPORTED_MONEY_FLOW_INDEX_FIELDS:
+                errors.append(f"资金流字段{label}不可用")
+                continue
+            field = _MONEY_FLOW_INDEX_FIELDS.get(label)
+            actual = money_flow.get(field) if field else None
+            if not field or actual is None or _field_contract_status(packet, f"money_flow.{field}") != "ok":
+                errors.append(f"资金流字段{label}不可用")
+                continue
+            try:
+                claimed = float(match.group("value"))
+                actual_num = float(actual)
+            except (TypeError, ValueError):
+                continue
+            if abs(claimed - actual_num) > _money_flow_claim_tolerance(actual_num):
+                errors.append(
+                    f"{label}引用{_format_score(claimed)}与实际{_format_score(actual_num)}不一致"
+                )
+
+        for label in _UNSUPPORTED_MONEY_FLOW_INDEX_FIELDS:
+            if label not in matched_labels and _phrase_is_asserted(sentence, label):
+                errors.append(f"资金流字段{label}不可用")
+
+        for match in _MONEY_FLOW_NET_VALUE_RE.finditer(sentence):
+            if not _phrase_is_asserted(sentence, match.group(0)):
+                continue
+            field = _money_flow_net_field(match)
+            actual = money_flow.get(field) if field else None
+            if not field or actual is None or _field_contract_status(packet, f"money_flow.{field}") != "ok":
+                errors.append(f"资金流字段{field or match.group(0)}不可用")
+                continue
+            try:
+                claimed = float(match.group("value"))
+                if match.group("direction") == "流出" and claimed > 0:
+                    claimed = -claimed
+                actual_num = float(actual)
+            except (TypeError, ValueError):
+                continue
+            if abs(claimed - actual_num) > _money_flow_claim_tolerance(actual_num):
+                errors.append(
+                    f"资金流净额引用{_format_score(claimed)}与实际"
+                    f"{_format_score(actual_num)}不一致:{field}"
+                )
+    return errors
+
+
+_TECH_SCORE_CLAIM_RE = re.compile(
+    r"(?P<label>(?:否决后|规则|量化|综合|原始)?\s*技术(?:形态|面)?(?:评分|得分|分数|分))"
+    r"\s*(?:为|是|=|:|：)?\s*"
+    r"(?P<score>\d+(?:\.\d+)?)\s*(?P<unit>/\s*100|分)?"
+    r"(?:\s*(?P<op><=|>=|<|>|≤|≥|低于|高于|不高于|不低于)\s*"
+    r"(?P<threshold>\d+(?:\.\d+)?))?",
+    flags=re.IGNORECASE,
+)
+_TECH_SCORE_THRESHOLD_RE = re.compile(
+    r"(?P<label>(?:否决后|规则|量化|综合|原始)?\s*技术(?:形态|面)?(?:评分|得分|分数|分))"
+    r"\s*(?P<op><=|>=|<|>|≤|≥|低于|高于|不高于|不低于)\s*"
+    r"(?P<threshold>\d+(?:\.\d+)?)",
+    flags=re.IGNORECASE,
+)
+
+
+def _role_evidence_packet(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach node-produced technical facts without mutating the market packet."""
+    packet = dict(state.get("debate_packet") or {})
+    workflow_evidence = dict(packet.get("_workflow_evidence") or {})
+    for key in (
+        "tech_pattern_score",
+        "tech_raw_score",
+        "tech_max_score",
+        "tech_rule_signal",
+        "tech_veto_reasons",
+    ):
+        if key in state:
+            workflow_evidence[key] = state.get(key)
+    if workflow_evidence:
+        packet["_workflow_evidence"] = workflow_evidence
+    return packet
+
+
+def _tech_score_actual(packet: Dict[str, Any], label: str) -> Optional[float]:
+    evidence = packet.get("_workflow_evidence") or {}
+    key = "tech_raw_score" if "原始" in str(label or "") else "tech_pattern_score"
+    value = evidence.get(key)
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _comparison_holds(left: float, operator: str, right: float) -> bool:
+    if operator in {"<", "低于"}:
+        return left < right
+    if operator in {"<=", "≤", "不高于"}:
+        return left <= right
+    if operator in {">", "高于"}:
+        return left > right
+    if operator in {">=", "≥", "不低于"}:
+        return left >= right
+    return True
+
+
+def _format_score(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else f"{value:g}"
+
+
+def _role_evidence_errors(packet: Dict[str, Any], response: str) -> list[str]:
+    """Catch deterministic fact contradictions before one role can poison later nodes."""
+    text = str(response or "")
+    if not text.strip():
+        return ["模型输出为空"]
+    errors: list[str] = []
+    contract = packet.get("data_contract") or {}
+    for category, item in contract.items():
+        if category not in _MISSING_CATEGORY_TERMS or (item or {}).get("status") in {"ok", "partial"}:
+            continue
+        if _uses_missing_category_as_fact(text, _MISSING_CATEGORY_TERMS.get(category, [])):
+            errors.append(f"使用了不可用数据类别:{category}")
+
+    indicators = packet.get("indicators") or {}
+    macd_state = str(indicators.get("macd_state") or "")
+    macd_cross = str(indicators.get("macd_cross_event") or "")
+    if _macd_event_is_asserted(text, "金叉") and macd_cross != "金叉":
+        errors.append(f"MACD金叉与实际事件{macd_cross or '无'}不一致")
+    if _macd_event_is_asserted(text, "死叉") and macd_cross != "死叉":
+        errors.append(f"MACD死叉与实际事件{macd_cross or '无'}不一致")
+    if _phrase_is_asserted(text, "MACD多头") and macd_state != "多头":
+        errors.append(f"MACD多头与实际状态{macd_state or '未知'}不一致")
+    if _phrase_is_asserted(text, "MACD空头") and macd_state != "空头":
+        errors.append(f"MACD空头与实际状态{macd_state or '未知'}不一致")
+
+    ma_system = str((packet.get("kline_summary") or {}).get("ma_system") or "")
+    if _ma_arrangement_is_asserted(text, "多头") and "多头" not in ma_system:
+        errors.append(f"均线多头排列与实际{ma_system or '未知'}不一致")
+    if _ma_arrangement_is_asserted(text, "空头") and "空头" not in ma_system:
+        errors.append(f"均线空头排列与实际{ma_system or '未知'}不一致")
+
+    actual_rsi = indicators.get("rsi_14")
+    if actual_rsi is not None:
+        # Only validate an explicit current value. Thresholds such as RSI>75
+        # are trading rules, not claims that the current RSI equals 75.
+        for match in re.finditer(
+            r"RSI(?:\(14\))?\s*(?:=|为|约|:|：)\s*(\d+(?:\.\d+)?)",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            try:
+                if abs(float(match.group(1)) - float(actual_rsi)) > 1.0:
+                    errors.append(f"RSI引用{match.group(1)}与实际{actual_rsi}不一致")
+                    break
+            except (TypeError, ValueError):
+                pass
+
+    errors.extend(_money_flow_evidence_errors(packet, text))
+
+    for sentence in re.split(r"[。！？；;\n]", text):
+        for match in _TECH_SCORE_CLAIM_RE.finditer(sentence):
+            if not _phrase_is_asserted(sentence, match.group(0)):
+                continue
+            claimed = float(match.group("score"))
+            actual = _tech_score_actual(packet, match.group("label"))
+            if actual is not None and abs(claimed - actual) > 0.5:
+                errors.append(
+                    f"技术分引用{_format_score(claimed)}与实际{_format_score(actual)}不一致"
+                )
+            operator = match.group("op")
+            threshold = match.group("threshold")
+            if operator and threshold is not None:
+                left = actual if actual is not None else claimed
+                right = float(threshold)
+                if not _comparison_holds(left, operator, right):
+                    errors.append(
+                        f"技术分阈值比较{_format_score(left)}{operator}{_format_score(right)}不成立"
+                    )
+
+        for match in _TECH_SCORE_THRESHOLD_RE.finditer(sentence):
+            if not _phrase_is_asserted(sentence, match.group(0)):
+                continue
+            actual = _tech_score_actual(packet, match.group("label"))
+            if actual is None:
+                continue
+            right = float(match.group("threshold"))
+            operator = match.group("op")
+            if not _comparison_holds(actual, operator, right):
+                errors.append(
+                    f"技术分阈值比较{_format_score(actual)}{operator}{_format_score(right)}不成立"
+                )
+
+    tech_evidence = packet.get("_workflow_evidence") or {}
+    if "tech_veto_reasons" in tech_evidence and not (tech_evidence.get("tech_veto_reasons") or []):
+        technical_context = re.compile(r"技术|均线|MACD|RSI|量价|规则引擎|形态", flags=re.IGNORECASE)
+        for sentence in re.split(r"[。！？；;\n]", text):
+            hard_veto = any(
+                _phrase_is_asserted(sentence, phrase)
+                for phrase in ("硬否决", "强制否决")
+            ) and technical_context.search(sentence)
+            explicit_veto = any(
+                _phrase_is_asserted(sentence, phrase)
+                for phrase in ("触发技术否决", "触发规则否决", "触发量化否决")
+            )
+            if hard_veto or explicit_veto:
+                errors.append("声称触发技术硬否决但实际无否决原因")
+                break
+    return list(dict.fromkeys(errors))[:8]
+
+
+class RoleEvidenceValidationError(RuntimeError):
+    """A role response remained contradictory after one evidence repair."""
+
+
+def _replace_macd_event_claims(text: str, event: str, replacement: str) -> str:
+    patterns = (
+        re.compile(
+            rf"MACD[^，,。！？；;\n]{{0,30}}?{event}(?:已经|已)?(?:形成|出现|确认|有效)?",
+            flags=re.IGNORECASE,
+        ),
+        re.compile(
+            rf"(?:DIF(?:与|和|/)?DEA|零轴(?:上|下)?)"
+            rf"[^，,。！？；;\n]{{0,20}}?{event}(?:已经|已)?(?:形成|出现|确认|有效)?",
+            flags=re.IGNORECASE,
+        ),
+    )
+    repaired = str(text or "")
+    for pattern in patterns:
+        repaired = pattern.sub(replacement, repaired)
+    return repaired
+
+
+def _replace_ma_arrangement_claims(text: str, direction: str, replacement: str) -> str:
+    direct_pattern = _ma_direct_claim_pattern(direction)
+    phrase_pattern = re.compile(rf"(?:完美|典型|标准|完整)?{direction}排列")
+    ma_token = re.compile(r"MA(?:5|10|20|30|60|120|250)\b", flags=re.IGNORECASE)
+    parts = re.split(r"([。！？；;\n])", str(text or ""))
+    for index in range(0, len(parts), 2):
+        sentence = parts[index]
+        if not _ma_arrangement_is_asserted(sentence, direction):
+            continue
+
+        direct_matches = list(direct_pattern.finditer(sentence))
+        for match in reversed(direct_matches):
+            if not _phrase_is_asserted(sentence, match.group(0)):
+                continue
+            sentence = sentence[:match.start()] + replacement + sentence[match.end():]
+
+        matches = list(phrase_pattern.finditer(sentence))
+        for match in reversed(matches):
+            if not _phrase_is_asserted(sentence, match.group(0)):
+                continue
+            local_before = sentence[max(0, match.start() - 40):match.start()]
+            if "MACD" in local_before and "均线" not in local_before and not ma_token.search(local_before):
+                continue
+            replace_start = match.start()
+            ma_prefix = re.search(
+                r"均线(?:系统)?(?:当前|呈|为|是|已呈|形成|处于)?\s*[:：]?\s*$",
+                sentence[:match.start()],
+            )
+            if ma_prefix:
+                replace_start = ma_prefix.start()
+            sentence = sentence[:replace_start] + replacement + sentence[match.end():]
+        parts[index] = sentence
+    return "".join(parts)
+
+
+def _replace_money_flow_claims(packet: Dict[str, Any], text: str) -> str:
+    money_flow = packet.get("money_flow") or {}
+    parts = re.split(r"([。！？；;\n])", str(text or ""))
+    for index in range(0, len(parts), 2):
+        sentence = parts[index]
+
+        def _replace_composite_indexes(match: re.Match) -> str:
+            if not _phrase_is_asserted(sentence, match.group(0)):
+                return match.group(0)
+            canonical: list[str] = []
+            for label, field in _MONEY_FLOW_INDEX_FIELDS.items():
+                actual = money_flow.get(field)
+                if actual is not None and _field_contract_status(
+                    packet, f"money_flow.{field}"
+                ) == "ok":
+                    canonical.append(f"{label}={_format_score(float(actual))}")
+                else:
+                    canonical.append(f"{label}数据不可用")
+            return "、".join(canonical)
+
+        sentence = _MONEY_FLOW_COMPOSITE_INDEX_RE.sub(
+            _replace_composite_indexes,
+            sentence,
+        )
+
+        for wrong_label, (right_label, right_field) in _UNSUPPORTED_MONEY_FLOW_INDEX_FIELDS.items():
+            pattern = re.compile(
+                rf"{re.escape(wrong_label)}"
+                r"(?:\s*(?:为|是|=|:|：)?\s*[（(]?\s*[+-]?\d+(?:\.\d+)?\s*[）)]?)?",
+                flags=re.IGNORECASE,
+            )
+            for match in reversed(list(pattern.finditer(sentence))):
+                if not _phrase_is_asserted(sentence, match.group(0)):
+                    continue
+                actual = money_flow.get(right_field)
+                if actual is not None and _field_contract_status(packet, f"money_flow.{right_field}") == "ok":
+                    replacement = f"{right_label}={_format_score(float(actual))}"
+                else:
+                    replacement = f"{right_label}数据不可用"
+                sentence = sentence[:match.start()] + replacement + sentence[match.end():]
+
+        def _replace_index_value(match: re.Match) -> str:
+            if not _phrase_is_asserted(sentence, match.group(0)):
+                return match.group(0)
+            label = str(match.group("label") or "").upper().replace("日DD", "日DD")
+            field = _MONEY_FLOW_INDEX_FIELDS.get(label)
+            actual = money_flow.get(field) if field else None
+            if not field or actual is None or _field_contract_status(packet, f"money_flow.{field}") != "ok":
+                return f"{label}数据不可用"
+            try:
+                claimed = float(match.group("value"))
+                actual_num = float(actual)
+            except (TypeError, ValueError):
+                return match.group(0)
+            if abs(claimed - actual_num) <= _money_flow_claim_tolerance(actual_num):
+                return match.group(0)
+            return f"{label}={_format_score(actual_num)}"
+
+        sentence = _MONEY_FLOW_INDEX_VALUE_RE.sub(_replace_index_value, sentence)
+
+        def _replace_net_value(match: re.Match) -> str:
+            if not _phrase_is_asserted(sentence, match.group(0)):
+                return match.group(0)
+            field = _money_flow_net_field(match)
+            actual = money_flow.get(field) if field else None
+            horizon = str(match.group("horizon") or "")
+            actor = "主力" if str(match.group("actor") or "").startswith("主力") else "超大单"
+            if not field or actual is None or _field_contract_status(packet, f"money_flow.{field}") != "ok":
+                return f"{horizon}{actor}净额数据不可用"
+            try:
+                claimed = float(match.group("value"))
+                if match.group("direction") == "流出" and claimed > 0:
+                    claimed = -claimed
+                actual_num = float(actual)
+            except (TypeError, ValueError):
+                return match.group(0)
+            if abs(claimed - actual_num) <= _money_flow_claim_tolerance(actual_num):
+                return match.group(0)
+            direction = "流入" if actual_num >= 0 else "流出"
+            return f"{horizon}{actor}净{direction}{_format_score(abs(actual_num))}亿元"
+
+        sentence = _MONEY_FLOW_NET_VALUE_RE.sub(_replace_net_value, sentence)
+        parts[index] = sentence
+    return "".join(parts)
+
+
+def _deterministic_role_evidence_repair(
+    packet: Dict[str, Any],
+    response: str,
+    errors: list[str],
+) -> str:
+    """Correct only contradictions whose true value is explicit in the packet."""
+    text = str(response or "")
+    error_text = "\n".join(str(item) for item in errors)
+    indicators = packet.get("indicators") or {}
+    macd_state = str(indicators.get("macd_state") or "")
+    macd_cross = str(indicators.get("macd_cross_event") or "")
+
+    def _macd_replacement(event: str) -> str:
+        if macd_cross in {"金叉", "死叉"}:
+            return f"MACD{macd_cross}"
+        if macd_state in {"多头", "空头"}:
+            return f"MACD{macd_state}状态（本日无新{event}事件）"
+        return f"MACD本日无新{event}事件"
+
+    if "MACD金叉与实际事件" in error_text:
+        text = _replace_macd_event_claims(text, "金叉", _macd_replacement("金叉"))
+    if "MACD死叉与实际事件" in error_text:
+        text = _replace_macd_event_claims(text, "死叉", _macd_replacement("死叉"))
+
+    if "MACD多头与实际状态" in error_text:
+        replacement = f"MACD{macd_state}状态" if macd_state else "MACD状态未知"
+        text = text.replace("MACD多头", replacement)
+    if "MACD空头与实际状态" in error_text:
+        replacement = f"MACD{macd_state}状态" if macd_state else "MACD状态未知"
+        text = text.replace("MACD空头", replacement)
+
+    ma_system = str((packet.get("kline_summary") or {}).get("ma_system") or "")
+    if "多头" in ma_system:
+        ma_replacement = "均线多头排列"
+    elif "空头" in ma_system:
+        ma_replacement = "均线空头排列"
+    elif ma_system:
+        ma_replacement = f"均线系统{ma_system}"
+    else:
+        ma_replacement = "均线状态未知"
+    if "均线多头排列与实际" in error_text:
+        text = _replace_ma_arrangement_claims(text, "多头", ma_replacement)
+    if "均线空头排列与实际" in error_text:
+        text = _replace_ma_arrangement_claims(text, "空头", ma_replacement)
+
+    if (
+        "资金流字段" in error_text
+        or "DDX引用" in error_text
+        or "DDY引用" in error_text
+        or "资金流净额引用" in error_text
+    ):
+        text = _replace_money_flow_claims(packet, text)
+
+    actual_rsi = indicators.get("rsi_14")
+    if actual_rsi is not None and "RSI引用" in error_text:
+        rsi_pattern = re.compile(
+            r"(RSI(?:\(14\))?\s*(?:=|为|约|:|：)\s*)(\d+(?:\.\d+)?)",
+            flags=re.IGNORECASE,
+        )
+
+        def _replace_rsi(match: re.Match) -> str:
+            try:
+                if abs(float(match.group(2)) - float(actual_rsi)) <= 1.0:
+                    return match.group(0)
+            except (TypeError, ValueError):
+                return match.group(0)
+            return f"{match.group(1)}{actual_rsi}"
+
+        text = rsi_pattern.sub(_replace_rsi, text)
+
+    if "技术分引用" in error_text or "技术分阈值比较" in error_text:
+        def _replace_score_claim(match: re.Match) -> str:
+            actual = _tech_score_actual(packet, match.group("label"))
+            claimed = float(match.group("score"))
+            if actual is None:
+                actual = claimed
+            operator = match.group("op")
+            threshold = match.group("threshold")
+            invalid_comparison = bool(
+                operator
+                and threshold is not None
+                and not _comparison_holds(actual, operator, float(threshold))
+            )
+            invalid_value = abs(claimed - actual) > 0.5
+            if not invalid_comparison and not invalid_value:
+                return match.group(0)
+            return f"{match.group('label')}{_format_score(actual)}/100"
+
+        text = _TECH_SCORE_CLAIM_RE.sub(_replace_score_claim, text)
+
+        def _replace_threshold_claim(match: re.Match) -> str:
+            actual = _tech_score_actual(packet, match.group("label"))
+            if actual is None or _comparison_holds(
+                actual,
+                match.group("op"),
+                float(match.group("threshold")),
+            ):
+                return match.group(0)
+            return f"{match.group('label')}{_format_score(actual)}/100"
+
+        text = _TECH_SCORE_THRESHOLD_RE.sub(_replace_threshold_claim, text)
+
+    if "声称触发技术硬否决" in error_text:
+        text = re.sub(
+            r"(?:构成|形成|属于|命中|触发)?\s*(?:技术|规则|量化)?硬否决(?:条件|项|信号)?",
+            "未触发技术硬否决",
+            text,
+        )
+        text = re.sub(
+            r"触发(?:技术|规则|量化)?否决",
+            "未触发技术硬否决",
+            text,
+        )
+        text = re.sub(
+            r"(?:技术面?|规则引擎|量化)?\s*强制否决",
+            "未触发技术硬否决",
+            text,
+        )
+    return text
+
+
+def _call_role_guarded(
+    system: str,
+    prompt: str,
+    *,
+    packet: Dict[str, Any],
+    model: str,
+    timeout: int,
+    max_tokens: int,
+    actual_model_out: Optional[list] = None,
+) -> str:
+    response = _call_role(
+        system,
+        prompt,
+        model=model,
+        timeout=timeout,
+        max_tokens=max_tokens,
+        actual_model_out=actual_model_out,
+    )
+    errors = _role_evidence_errors(packet, response)
+    if not errors:
+        return response
+    # Cheap, fully deterministic corrections should happen before spending a
+    # second model call.  The corrected text still has to pass the exact same
+    # validator; anything not provable from the packet falls through to the
+    # model rewrite path below.
+    deterministic = _deterministic_role_evidence_repair(packet, response, errors)
+    deterministic_errors = _role_evidence_errors(packet, deterministic)
+    if not deterministic_errors:
+        stock_label = (
+            packet.get("stock_name")
+            or packet.get("name")
+            or packet.get("stock_code")
+            or "unknown"
+        )
+        logger.warning(
+            "[%s] 分析节点初次输出确定性证据纠偏后通过: %s",
+            stock_label,
+            errors,
+        )
+        return deterministic
+    errors = deterministic_errors
+    repair_prompt = (
+        prompt
+        + "\n\n【证据校验失败，必须重写】\n"
+        + "\n".join(f"- {error}" for error in errors)
+        + "\n只能使用数据包真实字段和值；无法验证的内容明确写无法验证。"
+    )
+    repaired = _call_role(
+        system,
+        repair_prompt,
+        model=model,
+        timeout=timeout,
+        max_tokens=max_tokens,
+        actual_model_out=actual_model_out,
+    )
+    repaired_errors = _role_evidence_errors(packet, repaired)
+    if not repaired_errors:
+        return repaired
+    repaired_deterministic = _deterministic_role_evidence_repair(packet, repaired, repaired_errors)
+    repaired_deterministic_errors = _role_evidence_errors(packet, repaired_deterministic)
+    if not repaired_deterministic_errors:
+        stock_label = (
+            packet.get("stock_name")
+            or packet.get("name")
+            or packet.get("stock_code")
+            or "unknown"
+        )
+        logger.warning(
+            "[%s] 分析节点确定性证据纠偏后通过: %s",
+            stock_label,
+            repaired_errors,
+        )
+        return repaired_deterministic
+    logger.warning("分析节点证据校验失败，标记待重试: %s", repaired_errors)
+    raise RoleEvidenceValidationError("分析节点证据校验失败: " + "；".join(repaired_deterministic_errors))
 
 
 def _repair_portfolio_evidence(
@@ -389,12 +1181,13 @@ def _repair_portfolio_evidence(
         prompt=repair_prompt,
         schema=PortfolioManagerOutput,
         model=PORTFOLIO_MANAGER_PRIMARY_MODEL,
-        timeout=PORTFOLIO_MANAGER_GPT55_TIMEOUT,
+        timeout=PORTFOLIO_MANAGER_TIMEOUT,
         retries=1,
         thinking_budget=0,
         max_tokens=4096,
         allow_fallback=True,
         fallback_model=PORTFOLIO_MANAGER_SECONDARY_MODEL,
+        reasoning_effort=PORTFOLIO_MANAGER_PRIMARY_REASONING_EFFORT,
     )
 
 
@@ -404,6 +1197,7 @@ def _render_debate_packet(packet: Dict) -> str:
     mf = packet.get("money_flow", {})
     kls = packet.get("kline_summary", {})
     ind = packet.get("indicators", {})
+    snap = packet.get("verified_market_snapshot") or {}
     source_pools = packet.get("source_pools") or ([packet.get("pool")] if packet.get("pool") else [])
     strategy_types = packet.get("strategy_types") or ([packet.get("strategy_type")] if packet.get("strategy_type") else [])
     entry_biases = packet.get("entry_biases") or ([packet.get("entry_bias")] if packet.get("entry_bias") else [])
@@ -428,6 +1222,10 @@ def _render_debate_packet(packet: Dict) -> str:
         if source_reasons:
             source_lines.append(f"- 入池原因: {'；'.join([str(x) for x in source_reasons if x])[:220]}")
 
+    knowledge_lines = []
+    knowledge_text = _render_pm_knowledge_rules(packet)
+    if knowledge_text:
+        knowledge_lines = ["", "### 本地证券知识规则命中", knowledge_text]
 
     # Pre-compute conditionals for f-strings
     chk_5d = "V" if (kls.get('trend_pct_5d') or 0) > 0 else "X"
@@ -441,9 +1239,16 @@ def _render_debate_packet(packet: Dict) -> str:
         f"## {packet.get('name', packet.get('stock_code', 'N/A'))}（{packet.get('stock_code', 'N/A')}）",
         f"**所属行业**: {packet.get('sector', 'N/A')}",
         *source_lines,
+        *knowledge_lines,
         "",
         "### 数据可用性合同",
         _render_data_contract(packet),
+        "",
+        "### 统一行情事实快照",
+        f"- status={snap.get('status', 'N/A')} source={snap.get('source', 'N/A')} bars={snap.get('bar_count', 'N/A')} as_of={snap.get('as_of', 'N/A')}",
+        f"- 收盘={snap.get('latest_close', 'N/A')} 涨跌1D={snap.get('pct_change_1d', 'N/A')}% 5D={snap.get('pct_change_5d', 'N/A')}% 20D={snap.get('pct_change_20d', 'N/A')}%",
+        f"- 趋势={snap.get('trend_state', 'N/A')} 均线={snap.get('ma_alignment', 'N/A')} 20日位置={snap.get('close_position_20d', 'N/A')} 量比={snap.get('volume_ratio_5_20', 'N/A')}",
+        f"- RSI14={snap.get('rsi14', 'N/A')} MACD状态={((snap.get('macd') or {}).get('state', 'N/A'))} MACD交叉事件={((snap.get('macd') or {}).get('cross_event', '无'))} KDJ={((snap.get('kdj') or {}).get('signal', 'N/A'))} ATR14={snap.get('atr14', 'N/A')}",
         "",
         "### 证据使用规则",
         "- status=ok 的字段才可作为判断依据；partial/missing/unknown 只能写无法验证，不得推断。",
@@ -482,8 +1287,8 @@ def _render_debate_packet(packet: Dict) -> str:
         "",
         "### 技术指标",
         f"- RSI(14): {ind.get('rsi_14', 'N/A')}",
-        f"- MACD: {ind.get('macd', 'N/A')}",
-        f"- MACD信号: {ind.get('macd_signal', 'N/A')}",
+        f"- MACD DIF/DEA/柱: {ind.get('macd', 'N/A')}/{ind.get('macd_dea', 'N/A')}/{ind.get('macd_hist', 'N/A')}",
+        f"- MACD状态: {ind.get('macd_state', 'N/A')}；交叉事件: {ind.get('macd_cross_event', '无')}；柱斜率: {ind.get('macd_breadth', 'N/A')}",
         f"- 量价信号: {kls.get('vol_signal', 'N/A')}",
         "",
         "### 短线参考门槛（必须结合入池逻辑解释，不能机械否决）",
@@ -543,6 +1348,7 @@ class InvestDebateState(TypedDict, total=False):
     max_rounds: int
     model: str
     node_models_log: list[Dict[str, str]]
+    _node_resume: Dict[str, Dict[str, Any]]
 
 
 class RiskDebateState(TypedDict, total=False):
@@ -565,6 +1371,10 @@ class RiskDebateState(TypedDict, total=False):
     buy_score: int
     confidence: int
     position_ratio: float
+    allow_direct_buy: bool
+    needs_intraday_confirmation: bool
+    entry_condition: str
+    block_buy_reason: str
     reason: str
     decision_source: str
     raw_final_decision: str
@@ -575,6 +1385,56 @@ class RiskDebateState(TypedDict, total=False):
     evidence_validation: dict
     node_models_log: list[Dict[str, str]]
     data_quality_flags: list[str]
+    tech_pattern_score: int
+    tech_rule_signal: str
+    tech_raw_score: int
+    tech_max_score: int
+    tech_veto_reasons: list[str]
+    _node_resume: Dict[str, Dict[str, Any]]
+
+
+_NODE_CHECKPOINT_LOCAL = threading.local()
+
+
+def _node_checkpoint_key(phase: str, node_name: str, state: Dict[str, Any]) -> str:
+    count = int(state.get("count", 0) or 0)
+    # Only the research manager can legitimately run twice at the same count:
+    # once after Bull/Bear and once after the technical analyst.  Applying the
+    # marker to every node creates bogus keys such as bull_researcher.0.tech
+    # when LangGraph resumes after a downstream failure.
+    marker = (
+        "tech"
+        if node_name == "research_manager" and state.get("tech_analyst_verdict")
+        else "debate"
+    )
+    return f"{phase}.{node_name}.{count}.{marker}"
+
+
+def _checkpointed_node(phase: str, node_name: str, node_fn):
+    def wrapped(state):
+        key = _node_checkpoint_key(phase, node_name, state)
+        resume_nodes = state.get("_node_resume") or {}
+        cached = resume_nodes.get(key)
+        if isinstance(cached, dict) and cached:
+            logger.info(f"[{state.get('stock_name', '')}] 节点断点复用: {key}")
+            restored = dict(state)
+            restored.update(cached)
+            restored["_node_resume"] = resume_nodes
+            return restored
+
+        result = node_fn(state)
+        snapshot = {
+            k: _sanitize(v)
+            for k, v in dict(result or {}).items()
+            if k not in {"debate_packet", "market_context", "_node_resume"}
+        }
+        callback = getattr(_NODE_CHECKPOINT_LOCAL, "callback", None)
+        if callback:
+            callback(str(state.get("stock_code") or ""), key, snapshot)
+        return result
+
+    wrapped.__name__ = f"checkpointed_{phase}_{node_name}"
+    return wrapped
 
 
 # ── 状态更新辅助 ─────────────────────────────────────────
@@ -727,7 +1587,7 @@ def bull_researcher_node(state: InvestDebateState) -> InvestDebateState:
     )
 
     used_holder: List[Optional[str]] = [None]
-    response = _call_role(SYSTEM_PROMPT, prompt, model=state.get("model", DEFAULT_MODEL), timeout=120, max_tokens=2048, actual_model_out=used_holder)
+    response = _call_role_guarded(SYSTEM_PROMPT, prompt, packet=_role_evidence_packet(state), model=state.get("model", DEFAULT_MODEL), timeout=120, max_tokens=ROLE_MAX_TOKENS, actual_model_out=used_holder)
     argument = f"【多方分析师】{response}"
 
     new_history = state.get("history", "") + f"\n{argument}"
@@ -862,7 +1722,7 @@ def bear_researcher_node(state: InvestDebateState) -> InvestDebateState:
     )
 
     used_holder: List[Optional[str]] = [None]
-    response = _call_role(SYSTEM_PROMPT, prompt, model=state.get("model", DEFAULT_MODEL), timeout=120, max_tokens=2048, actual_model_out=used_holder)
+    response = _call_role_guarded(SYSTEM_PROMPT, prompt, packet=_role_evidence_packet(state), model=state.get("model", DEFAULT_MODEL), timeout=120, max_tokens=ROLE_MAX_TOKENS, actual_model_out=used_holder)
     argument = f"【空方分析师】{response}"
 
     new_history = state.get("history", "") + f"\n{argument}"
@@ -894,20 +1754,34 @@ def tech_analyst_node(state: InvestDebateState) -> InvestDebateState:
         logger.warning(f"[{stock_name}] 规则引擎失败: {e}")
         score_result = {"total_score": 50, "veto": False, "signal": "WATCH", "confidence": 50, "breakdown": {}}
         tech_score_json = "{}"
+
+    signal = score_result.get("signal", "WATCH")
+    confidence = score_result.get("confidence", 50)
+    raw_total = score_result.get("raw_total", 0)
+    max_total = score_result.get("max_total", 100)
+    veto_reasons = score_result.get("veto_reasons", []) or []
+    tech_validation_state = dict(state)
+    tech_validation_state.update({
+        "tech_pattern_score": score_result.get("total_score", 50),
+        "tech_rule_signal": signal,
+        "tech_raw_score": raw_total,
+        "tech_max_score": max_total,
+        "tech_veto_reasons": veto_reasons,
+    })
     
     # ── Step 2: LLM解读量化分（简短）──
     prompt = TECH_ANALYST_PROMPT.format(tech_score_result=tech_score_json)
     tech_flags = list(dict.fromkeys((state.get("data_quality_flags") or []) + (packet.get("data_quality_flags") or [])))
+    used_holder: List[Optional[str]] = [None]
     try:
-        response = _call_llm_with_fallback(
-            prompt=prompt,
-            system=SYSTEM_PROMPT,
+        response = _call_role_guarded(
+            SYSTEM_PROMPT,
+            prompt,
+            packet=_role_evidence_packet(tech_validation_state),
             model=state.get("model", TECH_ANALYST_MODEL),
-            fallback_model=TECH_ANALYST_FALLBACK_MODEL,
-            thinking_budget=THINKING_BUDGET_VOLCAN,
-            fallback_thinking_budget=THINKING_BUDGET_MINIMAX,
-            temperature=0.3,
             timeout=60,
+            max_tokens=ROLE_MAX_TOKENS,
+            actual_model_out=used_holder,
         )
         if not response:
             raise RuntimeError("技术形态分析师LLM返回空响应")
@@ -918,18 +1792,13 @@ def tech_analyst_node(state: InvestDebateState) -> InvestDebateState:
             tech_flags.append("TECH_ANALYSIS_MISSING")
     
     verdict = f"【技术形态分析师】{response}"
-
-    # 提取信号和置信度（从规则引擎结果）
-    signal = score_result.get("signal", "WATCH")
-    confidence = score_result.get("confidence", 50)
-    raw_total = score_result.get("raw_total", 0)
-    max_total = score_result.get("max_total", 100)
-    
-    # 提取否决原因
-    veto_reasons = score_result.get("veto_reasons", [])
-    veto_text = "\n".join(veto_reasons) if veto_reasons else "无"
     
     new_history = state.get("history", "") + f"\n{verdict}"
+    node_models_log = list(state.get("node_models_log") or [])
+    node_models_log.append({
+        "node": "tech",
+        "model": used_holder[0] or "rule-fallback",
+    })
     
     logger.info(f"[{stock_name}] Tech Analyst: {signal}={confidence}%, raw={raw_total}/{max_total}, veto={veto_reasons}")
 
@@ -943,6 +1812,7 @@ def tech_analyst_node(state: InvestDebateState) -> InvestDebateState:
         tech_max_score=max_total,
         tech_veto_reasons=veto_reasons,
         data_quality_flags=tech_flags,
+        node_models_log=node_models_log,
         history=new_history,
         current_response=verdict,
     )
@@ -1073,7 +1943,7 @@ def research_manager_node(state: InvestDebateState) -> InvestDebateState:
     )
 
     used_holder: List[Optional[str]] = [None]
-    response = _call_role(SYSTEM_PROMPT, prompt, model=state.get("model", DEFAULT_MODEL), timeout=120, max_tokens=2048, actual_model_out=used_holder)
+    response = _call_role_guarded(SYSTEM_PROMPT, prompt, packet=_role_evidence_packet(state), model=state.get("model", DEFAULT_MODEL), timeout=120, max_tokens=ROLE_MAX_TOKENS, actual_model_out=used_holder)
     response = _compact_research_manager_response(response)
     logger.info(f"[{stock_name}] 研究总监原始响应 (len={len(response)}): {response[:300]}")
     logger.info(f"[{stock_name}] 研究总监裁决: {response[:100]}...")
@@ -1151,7 +2021,7 @@ def aggressive_analyst_node(state: RiskDebateState) -> RiskDebateState:
     )
 
     used_holder: List[Optional[str]] = [None]
-    response = _call_role(SYSTEM_PROMPT, prompt, model=state.get("model", DEFAULT_MODEL), timeout=120, max_tokens=2048, actual_model_out=used_holder)
+    response = _call_role_guarded(SYSTEM_PROMPT, prompt, packet=_role_evidence_packet(state), model=state.get("model", DEFAULT_MODEL), timeout=120, max_tokens=ROLE_MAX_TOKENS, actual_model_out=used_holder)
     argument = f"【激进风险分析师】{response}"
 
     new_history = state.get("history", "") + f"\n{argument}"
@@ -1214,7 +2084,7 @@ def conservative_analyst_node(state: RiskDebateState) -> RiskDebateState:
     )
 
     used_holder: List[Optional[str]] = [None]
-    response = _call_role(SYSTEM_PROMPT, prompt, model=state.get("model", DEFAULT_MODEL), timeout=120, max_tokens=2048, actual_model_out=used_holder)
+    response = _call_role_guarded(SYSTEM_PROMPT, prompt, packet=_role_evidence_packet(state), model=state.get("model", DEFAULT_MODEL), timeout=120, max_tokens=ROLE_MAX_TOKENS, actual_model_out=used_holder)
     argument = f"【保守风险分析师】{response}"
 
     new_history = state.get("history", "") + f"\n{argument}"
@@ -1282,7 +2152,7 @@ def neutral_analyst_node(state: RiskDebateState) -> RiskDebateState:
     )
 
     used_holder: List[Optional[str]] = [None]
-    response = _call_role(SYSTEM_PROMPT, prompt, model=state.get("model", DEFAULT_MODEL), timeout=120, max_tokens=2048, actual_model_out=used_holder)
+    response = _call_role_guarded(SYSTEM_PROMPT, prompt, packet=_role_evidence_packet(state), model=state.get("model", DEFAULT_MODEL), timeout=120, max_tokens=ROLE_MAX_TOKENS, actual_model_out=used_holder)
     # 日志：记录中性分析师原始响应
     logger.info(f"[{stock_name}] 中性分析师原始响应 (len={len(response)}): {response[:300]}")
     argument = f"【中性风险分析师】{response}"
@@ -1346,10 +2216,14 @@ PORTFOLIO_MANAGER_PROMPT = """你是**短线机会基金经理（Portfolio Manag
 ## 可引用证据字段
 {available_evidence_refs}
 
+## 本地证券知识规则命中
+{knowledge_rules}
+
 ## 证据约束
 - reason 中每个核心判断必须能对应 evidence_refs 中至少一个字段。
 - evidence_refs 只能引用上方可引用证据字段或数据包中真实存在且 status=ok 的字段。
-- status=partial/missing/unknown 的字段只能写“无法验证”，不得作为正面或负面推断依据。
+- evidence_refs 不得为空，且每项 value 必须逐字对应数据包中的真实原值，不能只写方向性概括。
+- 类别 status=partial 时仅可引用 field_status=ok 的具体字段；field_status=missing 以及类别 missing/unknown 只能写“无法验证”。
 - 如果发现某个分析师使用了缺失字段，应在 reason 中说明已降低该论据权重。
 - unsupported_claims 应为空；若无法为空，请降低 buy_score 与 confidence。
 
@@ -1357,7 +2231,7 @@ PORTFOLIO_MANAGER_PROMPT = """你是**短线机会基金经理（Portfolio Manag
 - **假设当前没有任何持仓**
 - 你的任务是判断：**这只候选股是否值得进入短线新开仓观察/买入池**
 - 不要出现"减仓"、"持有"、"已持仓"、"若已有仓位"等基于已有持仓的管理建议
-- 系统会另行用技术量化分、池内分、资金流、次日可买性和回测代理分计算最终置信值与Top5排序；你给出的 buy_score 会参与最终综合排序，但不是唯一排序依据。
+- 系统会另行用技术量化分、池内分、资金流、次日可买性和已成熟的历史复盘规则计算最终做多分；当前股票不使用向后回放收益。你给出的 buy_score 仅作为短线机会修正依据。
 - 你的角色不是长期价值审查员，而是短线机会裁判：在候选池内，优先识别未来1-3个交易日的上涨机会，同时校准明显风险。
 - 基本面平庸不能单独否决短线机会；只有短期会直接压制股价的基本面/消息风险才应明显扣分。
 - 只要短线技术、资金、题材催化、策略回测中至少两项形成有效共振，应倾向 BUY 或 WATCH；只有出现明确硬否决项才给 AVOID。
@@ -1396,14 +2270,7 @@ PORTFOLIO_MANAGER_PROMPT = """你是**短线机会基金经理（Portfolio Manag
 只输出一个 JSON 对象。第一个字符必须是 {{，最后一个字符必须是 }}。
 不要输出 markdown、代码块、解释文字、前缀或后缀。
 字段：
-- signal: BUY、WATCH 或 AVOID
-- buy_score: 0 到 100 的整数，表示做多吸引力
-- confidence: 0 到 100 的整数
-- position_ratio: 0.0 到 1.0 的数字
-- reason: 2-3句话的核心理由
-- evidence_refs: 数组，每项包含 field、value、claim；字段必须真实存在且可用，value 一律写成字符串
-- missing_data_used: 数组，只能填写 data_contract 中实际 status!=ok 的大类，允许值仅为 kline、money_flow、financial、sector、news；没有则 []。不要填写公告原文、龙虎榜、盘中数据、指标名等细分项。
-- unsupported_claims: 数组，列出无法由数据支持的表述；正常应为 []
+{pm_json_fields}
 """
 
 PORTFOLIO_MANAGER_THINKING_PROMPT = """你是**短线机会基金经理（Portfolio Manager）**，负责综合所有分析师的观点，对"这只股票未来1-3个交易日是否值得新买入（做多）"给出最终判断。
@@ -1423,10 +2290,14 @@ PORTFOLIO_MANAGER_THINKING_PROMPT = """你是**短线机会基金经理（Portfo
 ## 可引用证据字段
 {available_evidence_refs}
 
+## 本地证券知识规则命中
+{knowledge_rules}
+
 ## 证据约束
 - reason 中每个核心判断必须能对应 evidence_refs 中至少一个字段。
 - evidence_refs 只能引用上方可引用证据字段或数据包中真实存在且 status=ok 的字段。
-- status=partial/missing/unknown 的字段只能写“无法验证”，不得作为正面或负面推断依据。
+- evidence_refs 不得为空，且每项 value 必须逐字对应数据包中的真实原值，不能只写方向性概括。
+- 类别 status=partial 时仅可引用 field_status=ok 的具体字段；field_status=missing 以及类别 missing/unknown 只能写“无法验证”。
 - missing_data_used 只能填写 data_contract 中实际 status!=ok 的大类，允许值仅为 kline、money_flow、financial、sector、news；不得填写公告原文、龙虎榜、盘中数据、指标名等细分项。
 - 如果发现某个分析师使用了缺失字段，应在 reason 中说明已降低该论据权重。
 - unsupported_claims 应为空；若无法为空，请降低 buy_score 与 confidence。
@@ -1435,7 +2306,7 @@ PORTFOLIO_MANAGER_THINKING_PROMPT = """你是**短线机会基金经理（Portfo
 - **假设当前没有任何持仓**
 - 你的任务是判断：**这只候选股是否值得进入短线新开仓观察/买入池**
 - 不要出现"减仓"、"持有"、"已持仓"、"若已有仓位"等基于已有持仓的管理建议
-- 系统会另行用技术量化分、池内分、资金流、次日可买性和回测代理分计算最终置信值与Top5排序；你给出的 buy_score 会参与最终综合排序，但不是唯一排序依据。
+- 系统会另行用技术量化分、池内分、资金流、次日可买性和已成熟的历史复盘规则计算最终做多分；当前股票不使用向后回放收益。你给出的 buy_score 仅作为短线机会修正依据。
 - 你的角色不是长期价值审查员，而是短线机会裁判：在候选池内，优先识别未来1-3个交易日的上涨机会，同时校准明显风险。
 - 基本面平庸不能单独否决短线机会；只有短期会直接压制股价的基本面/消息风险才应明显扣分。
 - 只要短线技术、资金、题材催化、策略回测中至少两项形成有效共振，应倾向 BUY 或 WATCH；只有出现明确硬否决项才给 AVOID。
@@ -1471,12 +2342,8 @@ PORTFOLIO_MANAGER_THINKING_PROMPT = """你是**短线机会基金经理（Portfo
 ## 输出格式
 先用中文写出完整分析思路（2-4段话），综合各方观点给出判断逻辑。
 然后最后一行必须按以下格式输出结构化决策：
-signal: BUY（或其他）
-buy_score: 75（0-100整数）
-confidence: 75（0-100整数）
-position_ratio: 0.25（0.0-1.0）
-reason: 核心理由（2-3句话）
-evidence_refs: [{"field":"kline_summary.ma_system","value":"多头排列","claim":"均线趋势偏强"}]
+{pm_text_fields}
+evidence_refs: [{{"field":"kline_summary.ma_system","value":"多头排列","claim":"均线趋势偏强"}}]
 missing_data_used: []
 unsupported_claims: []"""
 
@@ -1493,18 +2360,22 @@ PORTFOLIO_MANAGER_TEXT_PROMPT = """你是**短线机会基金经理（Portfolio 
 - 假设当前没有任何持仓
 - 你的任务是判断：这只候选股是否值得进入短线新开仓观察/买入池
 - 不要出现"减仓"、"持有"、"已持仓"、"若已有仓位"等基于已有持仓的管理建议
-- 系统会另行用技术量化分、池内分、资金流、次日可买性和回测代理分计算最终置信值与Top5排序；你给出的 buy_score 会参与最终综合排序，但不是唯一排序依据。
+- 系统会另行用技术量化分、池内分、资金流、次日可买性和已成熟的历史复盘规则计算最终做多分；当前股票不使用向后回放收益。你给出的 buy_score 仅作为短线机会修正依据。
 - 优先判断未来1-3个交易日的短线机会，不做长期价值审查。
 - 基本面平庸不能单独否决短线机会；只有重大负面、趋势破位、资金明显出逃、核心看多逻辑被证伪或数据严重缺失时才给 AVOID。
 - 只要短线技术、资金、题材催化、策略回测中至少两项有效共振，应倾向 BUY 或 WATCH。
 
 ## 输出格式
 输出纯文本，不要输出 JSON，不要 markdown 代码块。
-必须包含以下四行：
+必须包含以下字段行：
 最终信号: BUY / WATCH / AVOID
 做多分: 0-100
 置信度: 0-100
 新开仓仓位上限: 0%-40%
+allow_direct_buy: true/false
+needs_intraday_confirmation: true/false
+entry_condition: 盘中买入条件
+block_buy_reason: 不能直接BUY的原因，没有则空
 核心理由: 2-3句话"""
 
 
@@ -1512,7 +2383,7 @@ def _parse_portfolio_manager_text(text: str) -> Optional[dict]:
     """Parse PM output from thinking-mode text response."""
     if not text:
         return None
-    # ──优先尝试 JSON 解析（GPT-5.5 等模型可能返回 JSON 格式）──
+    # ──优先尝试 JSON 解析（GPT-5.6 Sol 等模型可能返回 JSON 格式）──
     import json
     json_text = text.strip()
     # 尝试提取 JSON 对象（可能有前缀/后缀文字）
@@ -1560,6 +2431,10 @@ def _parse_portfolio_manager_text(text: str) -> Optional[dict]:
                         "buy_score": max(0, min(100, int(buy_score))),
                         "confidence": max(0, min(100, conf)),
                         "position_ratio": round(ratio, 4),
+                        "allow_direct_buy": obj.get("allow_direct_buy"),
+                        "needs_intraday_confirmation": obj.get("needs_intraday_confirmation"),
+                        "entry_condition": obj.get("entry_condition", ""),
+                        "block_buy_reason": obj.get("block_buy_reason", ""),
                         "reason": reason,
                     }
             except (json.JSONDecodeError, ValueError, KeyError):
@@ -1582,15 +2457,28 @@ def _parse_portfolio_manager_text(text: str) -> Optional[dict]:
     position_ratio = float(m.group(1)) if m else 0.0
     if position_ratio > 1.0:
         position_ratio = position_ratio / 100.0
+    entry_m = re.search(r"(?:entry_condition|入场条件)\s*[:：]\s*(.+?)(?:\n|$)", cleaned, re.IGNORECASE)
+    block_m = re.search(r"(?:block_buy_reason|阻断理由)\s*[:：]\s*(.+?)(?:\n|$)", cleaned, re.IGNORECASE)
     m = re.search(r"(?:reason|核心理由)\s*[:：]\s*(.+?)(?:\n|$)", cleaned, re.IGNORECASE)
     reason = m.group(1).strip() if m else ""
     if re.search(r"PortfolioManagerOutput|\b\w+\s*\(.*\)", reason):
         reason = re.sub(r"PortfolioManagerOutput[^,\n]*", "", reason).strip() or ""
+
+    def _regex_bool(field: str):
+        match = re.search(rf"{re.escape(field)}\s*[:：]\s*(true|false|1|0|yes|no)", cleaned, re.IGNORECASE)
+        if not match:
+            return None
+        return match.group(1).lower() in {"true", "1", "yes"}
+
     return {
         "signal": signal,
         "buy_score": max(0, min(100, buy_score)),
         "confidence": max(0, min(100, confidence)),
         "position_ratio": round(position_ratio, 4),
+        "allow_direct_buy": _regex_bool("allow_direct_buy"),
+        "needs_intraday_confirmation": _regex_bool("needs_intraday_confirmation"),
+        "entry_condition": entry_m.group(1).strip() if entry_m else "",
+        "block_buy_reason": block_m.group(1).strip() if block_m else "",
         "reason": reason,
     }
 
@@ -1599,49 +2487,46 @@ def _repair_portfolio_json(raw_text: str, call_structured, PortfolioManagerOutpu
     repair_prompt = f"""下面是一只股票的基金经理最终裁决文本。你的任务只是把原文中的裁决抽取成 JSON，不要重新分析、不要改变判断、不要新增事实。
 
 如果原文没有明确给出某个字段，返回：
-{{"signal":"WATCH","buy_score":55,"confidence":0,"position_ratio":0.0,"reason":"最终裁决文本缺少必要字段，JSON修复失败，转为观察候选。","evidence_refs":[],"missing_data_used":[],"unsupported_claims":["最终裁决文本缺少必要字段"]}}
+{{"signal":"WATCH","buy_score":55,"confidence":0,"position_ratio":0.0,"allow_direct_buy":false,"needs_intraday_confirmation":true,"entry_condition":"盘中重新确认","block_buy_reason":"最终裁决文本缺少必要字段","reason":"最终裁决文本缺少必要字段，JSON修复失败，转为观察候选。","evidence_refs":[],"missing_data_used":[],"unsupported_claims":["最终裁决文本缺少必要字段"]}}
 
 原文：
 {raw_text}
 
-只输出一个 JSON 对象，字段为 signal、buy_score、confidence、position_ratio、reason、evidence_refs、missing_data_used、unsupported_claims。buy_score 和 confidence 必须是0-100整数，position_ratio 必须是 0.0-1.0。missing_data_used 只能填写 kline、money_flow、financial、sector、news 中实际缺失的大类；evidence_refs/missing_data_used/unsupported_claims 缺少明确依据时返回空数组。"""
+只输出一个 JSON 对象，字段要求：
+{pm_json_field_instructions()}
+buy_score 和 confidence 必须是0-100整数，position_ratio 必须是 0.0-1.0。missing_data_used 只能填写实际缺失的大类；evidence_refs 无法从原文中抽取时，必须把原因写入 unsupported_claims，不能伪造证据。"""
     return call_structured(
         repair_prompt,
         PortfolioManagerOutput,
-        model="openai/gpt-5.5",
+        model="openai/gpt-5.6-sol",
         fallback_model="minimax-portal/MiniMax-M3",
         thinking_budget=0,
         max_tokens=1000,
     )
 
-
 def _repair_empty_portfolio_structured(
     original_prompt: str,
     call_openai_responses,
     PortfolioManagerOutput,
+    model: str,
+    reasoning_effort: str,
 ) -> Optional[dict]:
-    """Give GPT-5.5 one concise second chance when structured output was empty."""
+    """Give the current OpenAI PM model one concise retry after empty JSON."""
     repair_prompt = f"""上一轮基金经理结构化裁决没有返回可解析 JSON。请重新基于同一事实材料裁决，不要新增事实，不要输出解释文字，只输出符合 schema 的 JSON。
 
 必须包含字段：
-- signal: BUY / WATCH / AVOID
-- buy_score: 0-100整数
-- confidence: 0-100整数
-- position_ratio: 0.0-1.0
-- reason: 2-3句话中文理由
-- evidence_refs: 数组，每项包含 field、value、claim；value 一律写成字符串；没有明确证据时 []
-- missing_data_used: 数组，只能填写 kline、money_flow、financial、sector、news 中实际缺失的大类；没有则 []
-- unsupported_claims: 数组；没有则 []
+{pm_json_field_instructions()}
 
 原始事实材料：
 {original_prompt}
 """
     return call_openai_responses(
         prompt=repair_prompt,
-        model="openai/gpt-5.5",
+        model=model,
         schema=PortfolioManagerOutput,
-        timeout=PORTFOLIO_MANAGER_GPT55_TIMEOUT,
+        timeout=PORTFOLIO_MANAGER_TIMEOUT,
         max_tokens=4096,
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -1665,17 +2550,49 @@ def _coerce_portfolio_fields(parsed: dict, default_ratio: float = 0.0) -> tuple[
     return sig, buy_score, conf, ratio, reason
 
 
-def _trip_portfolio_gpt55(reason: str) -> None:
-    global _pm_gpt55_broken, _pm_gpt55_failure_reason
-    _pm_gpt55_broken = True
-    _pm_gpt55_failure_reason = str(reason)[:300]
 
 
-def _portfolio_gpt55_is_available() -> bool:
+def _coerce_bool_field(value, default=None):
+    if isinstance(value, bool):
+        return value
+    if value is None or value == "":
+        return default
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "y", "是", "允许", "可直接买入"}:
+        return True
+    if text in {"false", "0", "no", "n", "否", "不允许", "需要确认"}:
+        return False
+    return default
+
+
+def _default_execution_gate(sig: str, buy_score: int) -> tuple[bool, bool, str, str]:
+    sig = str(sig or "WATCH").upper()
+    if sig == "BUY" and buy_score >= 70:
+        return True, False, "开盘强势或盘中强势可买", ""
+    if sig == "WATCH" and buy_score >= 55:
+        return False, True, "盘中放量突破或回踩承接确认", "需要盘中确认"
+    return False, True, "", "信号不足或存在风险"
+
+
+def _extract_execution_gate(obj, sig: str, buy_score: int):
+    allow_default, confirm_default, entry_default, block_default = _default_execution_gate(sig, buy_score)
+    allow = _coerce_bool_field(getattr(obj, "allow_direct_buy", None) if not isinstance(obj, dict) else obj.get("allow_direct_buy"), allow_default)
+    confirm = _coerce_bool_field(getattr(obj, "needs_intraday_confirmation", None) if not isinstance(obj, dict) else obj.get("needs_intraday_confirmation"), confirm_default)
+    entry = getattr(obj, "entry_condition", None) if not isinstance(obj, dict) else obj.get("entry_condition")
+    block = getattr(obj, "block_buy_reason", None) if not isinstance(obj, dict) else obj.get("block_buy_reason")
+    return bool(allow), bool(confirm), str(entry or entry_default or "")[:160], str(block or block_default or "")[:160]
+
+def _trip_portfolio_primary(reason: str) -> None:
+    global _pm_primary_broken, _pm_primary_failure_reason
+    _pm_primary_broken = True
+    _pm_primary_failure_reason = str(reason)[:300]
+
+
+def _portfolio_primary_is_available() -> bool:
     return (
-        PORTFOLIO_MANAGER_GPT55_ENABLED
+        PORTFOLIO_MANAGER_PRIMARY_ENABLED
         and bool(PORTFOLIO_MANAGER_PRIMARY_MODEL)
-        and not _pm_gpt55_broken
+        and not _pm_primary_broken
     )
 
 
@@ -1691,6 +2608,15 @@ def _secondary_is_available() -> bool:
 
 def _is_minimax_model(model: str) -> bool:
     return str(model or "").startswith("minimax-portal/") or str(model or "") == "MiniMax-M3"
+
+
+def _pm_model_label(model: str) -> str:
+    name = str(model or "").split("/", 1)[-1]
+    labels = {
+        "gpt-5.6-sol": "GPT-5.6-Sol",
+        "MiniMax-M3": "MiniMax-M3",
+    }
+    return labels.get(name, name or "unknown")
 
 
 def _load_selection_memory_rules(limit: int = 5) -> str:
@@ -1712,15 +2638,20 @@ def _load_selection_memory_rules(limit: int = 5) -> str:
             continue
         labels = item.get("attribution_labels") or []
         primary = item.get("primary_attribution") or (labels[0] if labels else "")
+        if not any(item.get(f"return_{h}_complete") is True for h in ("d1", "d3", "d5", "d10")):
+            continue
         if not primary:
             continue
         signal = item.get("signal") or ""
         buy_score = item.get("buy_score")
         stock = item.get("stock") or ""
         name = item.get("name") or ""
-        ret = item.get("return_d3_pct")
-        if ret is None:
-            ret = item.get("return_d1_pct")
+        ret = None
+        for horizon in ("d3", "d1", "d5"):
+            if item.get(f"return_{horizon}_complete") is True:
+                ret = item.get(f"return_{horizon}_pct")
+                if ret is not None:
+                    break
         ret_text = f"，后续收益{float(ret):+.2f}%" if isinstance(ret, (int, float)) else ""
         rule = f"{stock}{name} {signal} 做多分{buy_score} 归因{primary}{ret_text}"
         if rule in seen:
@@ -1737,15 +2668,14 @@ def _load_selection_memory_rules(limit: int = 5) -> str:
 
 def _call_portfolio_manager_structured(prompt: str, call_structured, PortfolioManagerOutput, stock_name: str):
     """
-    结构化裁决优先走 GPT-5.5；失败后 MiniMax M3 走 portal OAuth + adaptive thinking + JSON。
-    - GPT-5.5: 本函数控制3次重试（间隔1s），重试全部失败才触发熔断
-    - MiniMax M3: 优先 structured JSON，仍失败才交给 portfolio_manager_node 的文本兜底
+    基金经理三级结构化裁决：GPT-5.6 Sol(max) -> GPT-5.6 Sol(max) -> MiniMax M3。
+    每层按节点重试预算执行；只有认证、额度或限流错误才触发任务级熔断。
     """
-    global _pm_gpt55_fallback_count
-    from .providers import _call_structured_openai_responses, _call_structured_minimax
+    global _pm_primary_fallback_count
+    from .providers import _call_structured_openai_responses
     import time as _time
 
-    RETRIES = 3
+    RETRIES = _providers.effective_llm_retries("pm", 3)
     RETRY_INTERVAL = 1  # 秒
 
     class _Mock:
@@ -1756,50 +2686,57 @@ def _call_portfolio_manager_structured(prompt: str, call_structured, PortfolioMa
     # Dependency-injected tests and recovery tools need a deterministic one-shot
     # path instead of the full direct GPT/secondary cascade.
     if call_structured is not _call_structured:
+        injected_model = PORTFOLIO_MANAGER_TERTIARY_MODEL or PORTFOLIO_MANAGER_SECONDARY_MODEL
         structured = call_structured(
             prompt=prompt,
             schema=PortfolioManagerOutput,
-            model=PORTFOLIO_MANAGER_SECONDARY_MODEL,
-            timeout=PORTFOLIO_MANAGER_GPT55_TIMEOUT,
+            model=injected_model,
+            timeout=PORTFOLIO_MANAGER_TIMEOUT,
             retries=1,
-            thinking_budget=0,
+            thinking_budget=PORTFOLIO_MANAGER_MINIMAX_BUDGET if _is_minimax_model(injected_model) else 0,
             max_tokens=16384,
             allow_fallback=False,
         )
         if structured is not None:
-            return structured, f"Structured:{PORTFOLIO_MANAGER_SECONDARY_MODEL}"
+            return structured, f"Structured:{_pm_model_label(injected_model)}"
         raise RuntimeError("injected structured call returned None")
 
-    # ── 第1层：GPT-5.5 structured reasoning (deep thinking + json_schema) ──
-    if _portfolio_gpt55_is_available():
-        with _pm_gpt55_lock:
-            if _portfolio_gpt55_is_available():
+    # ── 第1层：GPT-5.6 Sol max structured reasoning ──
+    if _portfolio_primary_is_available():
+        with _pm_primary_lock:
+            if _portfolio_primary_is_available():
                 last_err = None
                 empty_structured_seen = False
+                primary_label = _pm_model_label(PORTFOLIO_MANAGER_PRIMARY_MODEL)
                 for attempt in range(RETRIES):
                     try:
                         data = _call_structured_openai_responses(
                             prompt=prompt,
-                            model="openai/gpt-5.5",
+                            model=PORTFOLIO_MANAGER_PRIMARY_MODEL,
                             schema=PortfolioManagerOutput,
-                            timeout=PORTFOLIO_MANAGER_GPT55_TIMEOUT,
+                            timeout=PORTFOLIO_MANAGER_TIMEOUT,
                             max_tokens=16384,
+                            reasoning_effort=PORTFOLIO_MANAGER_PRIMARY_REASONING_EFFORT,
                         )
                         if data is not None:
-                            logger.info(f"[{stock_name}] PM GPT-5.5 reasoning+structured成功: signal={data.get('signal')}")
-                            return _Mock(data), "Structured:GPT-5.5"
-                        logger.warning(f"[{stock_name}] PM GPT-5.5 structured返回None (attempt {attempt+1}/{RETRIES})")
+                            logger.info(
+                                f"[{stock_name}] PM {primary_label} "
+                                f"effort={PORTFOLIO_MANAGER_PRIMARY_REASONING_EFFORT} structured成功: "
+                                f"signal={data.get('signal')}"
+                            )
+                            return _Mock(data), f"Structured:{primary_label}"
+                        logger.warning(f"[{stock_name}] PM {primary_label} structured返回None (attempt {attempt+1}/{RETRIES})")
                         empty_structured_seen = True
-                        last_err = RuntimeError("GPT-5.5 structured返回None")
+                        last_err = RuntimeError(f"{primary_label} structured返回None")
                     except urllib.error.HTTPError as e:
                         last_err = e
                         if e.code in (429, 403):
-                            logger.warning(f"[{stock_name}] PM GPT-5.5 HTTP {e.code} 限流/配额 (attempt {attempt+1}/{RETRIES}): {e}")
+                            logger.warning(f"[{stock_name}] PM {primary_label} HTTP {e.code} 限流/配额 (attempt {attempt+1}/{RETRIES}): {e}")
                         else:
-                            logger.warning(f"[{stock_name}] PM GPT-5.5 HTTP错误 (attempt {attempt+1}/{RETRIES}): {e}")
+                            logger.warning(f"[{stock_name}] PM {primary_label} HTTP错误 (attempt {attempt+1}/{RETRIES}): {e}")
                     except Exception as e:
                         last_err = e
-                        logger.warning(f"[{stock_name}] PM GPT-5.5 structured失败 (attempt {attempt+1}/{RETRIES}): {e}")
+                        logger.warning(f"[{stock_name}] PM {primary_label} structured失败 (attempt {attempt+1}/{RETRIES}): {e}")
                     if attempt < RETRIES - 1:
                         _time.sleep(RETRY_INTERVAL)
 
@@ -1809,79 +2746,100 @@ def _call_portfolio_manager_structured(prompt: str, call_structured, PortfolioMa
                             prompt,
                             _call_structured_openai_responses,
                             PortfolioManagerOutput,
+                            PORTFOLIO_MANAGER_PRIMARY_MODEL,
+                            PORTFOLIO_MANAGER_PRIMARY_REASONING_EFFORT,
                         )
                         if data is not None:
-                            logger.info(f"[{stock_name}] PM GPT-5.5 structured空结果修复成功: signal={data.get('signal')}")
-                            return _Mock(data), "Structured:GPT-5.5Repair"
-                        last_err = RuntimeError("GPT-5.5 structured空结果修复返回None")
-                        logger.warning(f"[{stock_name}] PM GPT-5.5 structured空结果修复返回None")
+                            logger.info(f"[{stock_name}] PM {primary_label} structured空结果修复成功: signal={data.get('signal')}")
+                            return _Mock(data), f"Structured:{primary_label}Repair"
+                        last_err = RuntimeError(f"{primary_label} structured空结果修复返回None")
+                        logger.warning(f"[{stock_name}] PM {primary_label} structured空结果修复返回None")
                     except Exception as e:
                         last_err = e
-                        logger.warning(f"[{stock_name}] PM GPT-5.5 structured空结果修复失败: {e}")
+                        logger.warning(f"[{stock_name}] PM {primary_label} structured空结果修复失败: {e}")
 
                 # 重试全部失败后切 secondary model。只有认证/额度/限流类错误才全局熔断；
                 # SSL EOF/timeout 等瞬时网络错误只影响当前股票，避免一只股票把整批 PM 切走。
-                if _portfolio_gpt55_is_available():
+                if _portfolio_primary_is_available():
                     err_class = _providers.classify_llm_error(last_err)
                     if _providers.is_global_model_failure(last_err):
-                        _trip_portfolio_gpt55(last_err)
+                        _trip_portfolio_primary(last_err)
                         scope = "本次任务全局fallback"
                     else:
                         scope = "单票fallback"
-                    _pm_gpt55_fallback_count += 1
+                    _pm_primary_fallback_count += 1
                     logger.warning(
-                        f"[{stock_name}] PM GPT-5.5 重试{RETRIES}次均失败，"
+                        f"[{stock_name}] PM {primary_label} 重试{RETRIES}次均失败，"
                         f"{scope}到{PORTFOLIO_MANAGER_SECONDARY_MODEL} "
                         f"err_class={err_class}: {last_err}"
                     )
 
-    # ── 第2层：可配置 structured 兜底（MiniMax 使用 adaptive thinking + JSON） ──
+    # ── 第2层：GPT-5.6 Sol max structured 兜底 ──
     last_err = None
-    if _secondary_is_available() and PORTFOLIO_MANAGER_SECONDARY_MODEL:
+    if (
+        _secondary_is_available()
+        and PORTFOLIO_MANAGER_SECONDARY_MODEL
+        and PORTFOLIO_MANAGER_SECONDARY_MODEL != PORTFOLIO_MANAGER_PRIMARY_MODEL
+    ):
+        secondary_label = _pm_model_label(PORTFOLIO_MANAGER_SECONDARY_MODEL)
+        for attempt in range(RETRIES):
+            try:
+                data = _call_structured_openai_responses(
+                    prompt=prompt,
+                    model=PORTFOLIO_MANAGER_SECONDARY_MODEL,
+                    schema=PortfolioManagerOutput,
+                    timeout=PORTFOLIO_MANAGER_TIMEOUT,
+                    max_tokens=16384,
+                    reasoning_effort=PORTFOLIO_MANAGER_SECONDARY_REASONING_EFFORT,
+                )
+                if data is not None:
+                    logger.info(
+                        f"[{stock_name}] PM {secondary_label} "
+                        f"effort={PORTFOLIO_MANAGER_SECONDARY_REASONING_EFFORT} structured成功: "
+                        f"signal={data.get('signal')}"
+                    )
+                    return _Mock(data), f"Structured:{secondary_label}"
+                logger.warning(f"[{stock_name}] PM {secondary_label} structured返回None (attempt {attempt+1}/{RETRIES})")
+                last_err = RuntimeError(f"{secondary_label} structured返回None")
+            except Exception as e:
+                last_err = e
+                logger.warning(f"[{stock_name}] PM {secondary_label} structured失败 (attempt {attempt+1}/{RETRIES}): {e}")
+            if attempt < RETRIES - 1:
+                _time.sleep(RETRY_INTERVAL)
+        if _providers.is_global_model_failure(last_err):
+            _trip_secondary(last_err)
+        logger.warning(
+            f"[{stock_name}] PM {secondary_label} 重试{RETRIES}次均失败，"
+            f"切换到{PORTFOLIO_MANAGER_TERTIARY_MODEL}: {last_err}"
+        )
+
+    # ── 第3层：MiniMax M3 portal OAuth + adaptive thinking + JSON ──
+    if (
+        PORTFOLIO_MANAGER_MINIMAX_ENABLED
+        and PORTFOLIO_MANAGER_TERTIARY_MODEL
+        and PORTFOLIO_MANAGER_TERTIARY_MODEL != PORTFOLIO_MANAGER_SECONDARY_MODEL
+    ):
+        tertiary_label = _pm_model_label(PORTFOLIO_MANAGER_TERTIARY_MODEL)
         for attempt in range(RETRIES):
             try:
                 structured = call_structured(
                     prompt=prompt,
                     schema=PortfolioManagerOutput,
-                    model=PORTFOLIO_MANAGER_SECONDARY_MODEL,
-                    timeout=PORTFOLIO_MANAGER_GPT55_TIMEOUT,
+                    model=PORTFOLIO_MANAGER_TERTIARY_MODEL,
+                    timeout=PORTFOLIO_MANAGER_TIMEOUT,
                     retries=1,
-                    thinking_budget=PORTFOLIO_MANAGER_MINIMAX_BUDGET if _is_minimax_model(PORTFOLIO_MANAGER_SECONDARY_MODEL) else 0,
-                    max_tokens=16384,
-                    allow_fallback=bool(PORTFOLIO_MANAGER_SECONDARY_FALLBACK_MODEL),
-                    fallback_model=PORTFOLIO_MANAGER_SECONDARY_FALLBACK_MODEL,
-                )
-                if structured is not None:
-                    logger.info(f"[{stock_name}] PM {PORTFOLIO_MANAGER_SECONDARY_MODEL} structured成功: signal={structured.signal}")
-                    return structured, f"Structured:{PORTFOLIO_MANAGER_SECONDARY_MODEL}"
-                logger.warning(f"[{stock_name}] PM {PORTFOLIO_MANAGER_SECONDARY_MODEL} structured返回None (attempt {attempt+1}/{RETRIES})")
-                last_err = RuntimeError(f"{PORTFOLIO_MANAGER_SECONDARY_MODEL} structured返回None")
-            except Exception as e:
-                last_err = e
-                logger.warning(f"[{stock_name}] PM {PORTFOLIO_MANAGER_SECONDARY_MODEL} structured失败 (attempt {attempt+1}/{RETRIES}): {e}")
-            if attempt < RETRIES - 1:
-                _time.sleep(RETRY_INTERVAL)
-        _trip_secondary(last_err)
-
-    # ── 第3层：MiniMax structured（仅显式启用） ──
-    if PORTFOLIO_MANAGER_MINIMAX_ENABLED:
-        for attempt in range(RETRIES):
-            try:
-                data = _call_structured_minimax(
-                    prompt=prompt,
-                    schema=PortfolioManagerOutput,
-                    timeout=180,
                     thinking_budget=PORTFOLIO_MANAGER_MINIMAX_BUDGET,
                     max_tokens=16384,
+                    allow_fallback=False,
                 )
-                if data is not None:
-                    logger.info(f"[{stock_name}] PM MiniMax structured成功: signal={data.get('signal')}")
-                    return _Mock(data), "Structured:MiniMax-M3"
-                logger.warning(f"[{stock_name}] PM MiniMax structured返回None (attempt {attempt+1}/{RETRIES})")
-                last_err = RuntimeError("MiniMax structured返回None")
+                if structured is not None:
+                    logger.info(f"[{stock_name}] PM {tertiary_label} structured成功: signal={structured.signal}")
+                    return structured, f"Structured:{tertiary_label}"
+                logger.warning(f"[{stock_name}] PM {tertiary_label} structured返回None (attempt {attempt+1}/{RETRIES})")
+                last_err = RuntimeError(f"{tertiary_label} structured返回None")
             except Exception as e:
                 last_err = e
-                logger.warning(f"[{stock_name}] PM MiniMax structured失败 (attempt {attempt+1}/{RETRIES}): {e}")
+                logger.warning(f"[{stock_name}] PM {tertiary_label} structured失败 (attempt {attempt+1}/{RETRIES}): {e}")
             if attempt < RETRIES - 1:
                 _time.sleep(RETRY_INTERVAL)
 
@@ -1898,6 +2856,7 @@ def portfolio_manager_node(state: RiskDebateState) -> RiskDebateState:
     selection_memory = _load_selection_memory_rules()
 
     packet = state.get("debate_packet", {}) or {}
+    validation_packet = _role_evidence_packet(state)
     evidence_contract = _render_data_contract(packet)
     available_evidence_refs = _available_evidence_fields(packet)
 
@@ -1907,6 +2866,9 @@ def portfolio_manager_node(state: RiskDebateState) -> RiskDebateState:
         selection_memory=selection_memory,
         evidence_contract=evidence_contract,
         available_evidence_refs=available_evidence_refs,
+        knowledge_rules=_render_pm_knowledge_rules(packet),
+        pm_json_fields=pm_json_field_instructions(),
+        pm_text_fields=pm_text_field_instructions(),
     )
 
     # 基金经理优先走 structured；失败时回到纯文本裁决并修复成结构化字段。
@@ -1914,6 +2876,7 @@ def portfolio_manager_node(state: RiskDebateState) -> RiskDebateState:
     evidence_refs: list[dict] = []
     missing_data_used: list[str] = []
     unsupported_claims: list[str] = []
+    allow_direct_buy, needs_intraday_confirmation, entry_condition, block_buy_reason = _default_execution_gate("WATCH", 55)
     evidence_validation: dict = {"status": "unknown", "errors": [], "warnings": []}
     evidence_failed = False
     try:
@@ -1928,10 +2891,11 @@ def portfolio_manager_node(state: RiskDebateState) -> RiskDebateState:
         sig = _signal_from_buy_score(buy_score)
         ratio = _normalize_position_ratio(structured.position_ratio)
         reason = structured.reason
+        allow_direct_buy, needs_intraday_confirmation, entry_condition, block_buy_reason = _extract_execution_gate(structured, sig, buy_score)
         evidence_refs = _normalize_evidence_refs(getattr(structured, "evidence_refs", []))
         missing_data_used = _normalize_missing_data_used(getattr(structured, "missing_data_used", []) or [], packet)
         unsupported_claims = list(getattr(structured, "unsupported_claims", []) or [])
-        evidence_validation = _validate_pm_evidence(packet, reason, evidence_refs, missing_data_used, unsupported_claims)
+        evidence_validation = _validate_pm_evidence(validation_packet, reason, evidence_refs, missing_data_used, unsupported_claims)
         missing_data_used = list(evidence_validation.get("missing_data_used") or missing_data_used)
         if evidence_validation.get("status") == "fail":
             logger.warning(f"[{stock_name}] PM证据校验失败，尝试同材料重写: {evidence_validation}")
@@ -1951,13 +2915,15 @@ def portfolio_manager_node(state: RiskDebateState) -> RiskDebateState:
                 r_sig = _signal_from_buy_score(r_buy_score)
                 r_ratio = _normalize_position_ratio(repaired_structured.position_ratio)
                 r_reason = repaired_structured.reason
+                r_allow, r_confirm, r_entry, r_block = _extract_execution_gate(repaired_structured, r_sig, r_buy_score)
                 r_refs = _normalize_evidence_refs(getattr(repaired_structured, "evidence_refs", []))
                 r_missing = _normalize_missing_data_used(getattr(repaired_structured, "missing_data_used", []) or [], packet)
                 r_unsupported = list(getattr(repaired_structured, "unsupported_claims", []) or [])
-                r_validation = _validate_pm_evidence(packet, r_reason, r_refs, r_missing, r_unsupported)
+                r_validation = _validate_pm_evidence(validation_packet, r_reason, r_refs, r_missing, r_unsupported)
                 r_missing = list(r_validation.get("missing_data_used") or r_missing)
                 if r_validation.get("status") != "fail":
                     sig, conf, buy_score, ratio, reason = r_sig, r_conf, r_buy_score, r_ratio, r_reason
+                    allow_direct_buy, needs_intraday_confirmation, entry_condition, block_buy_reason = r_allow, r_confirm, r_entry, r_block
                     evidence_refs, missing_data_used, unsupported_claims = r_refs, r_missing, r_unsupported
                     evidence_validation = r_validation
                     structured_source = f"{structured_source}+EvidenceRepair"
@@ -1973,6 +2939,9 @@ def portfolio_manager_node(state: RiskDebateState) -> RiskDebateState:
             conf = max(0, conf - 12)
             ratio = min(ratio, 0.10)
             unsupported_claims = list(dict.fromkeys((unsupported_claims or []) + (evidence_validation.get("errors") or [])))
+            allow_direct_buy, needs_intraday_confirmation = False, True
+            block_buy_reason = "证据校验未通过"
+            entry_condition = "盘中重新确认"
             reason = f"证据校验未通过，已禁止进入BUY；{reason}"[:260]
         elif evidence_validation.get("status") == "warn":
             conf = max(0, conf - 5)
@@ -1988,14 +2957,18 @@ def portfolio_manager_node(state: RiskDebateState) -> RiskDebateState:
             selection_memory=selection_memory,
             evidence_contract=evidence_contract,
             available_evidence_refs=available_evidence_refs,
+            knowledge_rules=_render_pm_knowledge_rules(packet),
+            pm_json_fields=pm_json_field_instructions(),
+            pm_text_fields=pm_text_field_instructions(),
         )
         try:
+            text_model = PORTFOLIO_MANAGER_TERTIARY_MODEL or PORTFOLIO_MANAGER_SECONDARY_MODEL or DEFAULT_MODEL
             raw_text = _providers.call_llm(
                 text_prompt,
-                model=PORTFOLIO_MANAGER_SECONDARY_MODEL or DEFAULT_MODEL,
-                timeout=PORTFOLIO_MANAGER_GPT55_TIMEOUT,
+                model=text_model,
+                timeout=PORTFOLIO_MANAGER_TIMEOUT,
                 max_tokens=4096,
-                thinking_budget=PORTFOLIO_MANAGER_MINIMAX_BUDGET if _is_minimax_model(PORTFOLIO_MANAGER_SECONDARY_MODEL) else 0,
+                thinking_budget=PORTFOLIO_MANAGER_MINIMAX_BUDGET if _is_minimax_model(text_model) else 0,
                 temperature=0.3,
             )
         except Exception as text_err:
@@ -2012,6 +2985,7 @@ def portfolio_manager_node(state: RiskDebateState) -> RiskDebateState:
 
         if parsed_text:
             sig, buy_score, conf, ratio, reason = _coerce_portfolio_fields(parsed_text)
+            allow_direct_buy, needs_intraday_confirmation, entry_condition, block_buy_reason = _extract_execution_gate(parsed_text, sig, buy_score)
             decision_source = "MiniMaxThinkingText"
             decision_text = f"[MiniMaxThinkingText] signal={sig} buy_score={buy_score} confidence={conf} position_ratio={ratio*100:.0f}% reason={reason}"
             raw_final_decision = raw_text
@@ -2028,12 +3002,15 @@ def portfolio_manager_node(state: RiskDebateState) -> RiskDebateState:
             missing_data_used = _normalize_missing_data_used(getattr(repaired, "missing_data_used", []) or [], packet)
             unsupported_claims = list(getattr(repaired, "unsupported_claims", []) or [])
             sig, buy_score, conf, ratio, reason = _coerce_portfolio_fields(parsed)
+            allow_direct_buy, needs_intraday_confirmation, entry_condition, block_buy_reason = _extract_execution_gate(repaired, sig, buy_score)
             decision_source = "Repaired"
             decision_text = f"[Repaired] signal={sig} buy_score={buy_score} confidence={conf} position_ratio={ratio*100:.0f}% reason={reason}"
             raw_final_decision = raw_text
             logger.info(f"[{stock_name}] 基金经理文本修复成功: {sig} 做多{buy_score}分 置信{conf}分")
         else:
             sig, buy_score, conf, ratio = "WATCH", 55, 0, 0.0
+            allow_direct_buy, needs_intraday_confirmation = False, True
+            entry_condition, block_buy_reason = "盘中重新确认", "基金经理结构化裁决失败"
             reason = "基金经理结构化裁决失败，纯文本也缺少明确字段；不允许新开仓。"
             decision_source = "TextOnly"
             decision_text = f"[TextOnly] signal={sig} buy_score={buy_score} confidence={conf} position_ratio=0% reason={reason}"
@@ -2041,7 +3018,7 @@ def portfolio_manager_node(state: RiskDebateState) -> RiskDebateState:
             logger.warning(f"[{stock_name}] 基金经理转 TextOnly 零仓位")
 
     if not evidence_validation or evidence_validation.get("status") == "unknown":
-        evidence_validation = _validate_pm_evidence(packet, reason, evidence_refs, missing_data_used, unsupported_claims)
+        evidence_validation = _validate_pm_evidence(validation_packet, reason, evidence_refs, missing_data_used, unsupported_claims)
         missing_data_used = list(evidence_validation.get("missing_data_used") or missing_data_used)
         if evidence_validation.get("status") == "fail":
             buy_score = min(buy_score, 69)
@@ -2049,11 +3026,21 @@ def portfolio_manager_node(state: RiskDebateState) -> RiskDebateState:
             conf = max(0, conf - 12)
             ratio = min(ratio, 0.10)
             unsupported_claims = list(dict.fromkeys((unsupported_claims or []) + (evidence_validation.get("errors") or [])))
+            allow_direct_buy, needs_intraday_confirmation = False, True
+            block_buy_reason = "证据校验未通过"
+            entry_condition = "盘中重新确认"
             reason = f"证据校验未通过，已禁止进入BUY；{reason}"[:260]
             decision_text = f"[{decision_source}] signal={sig} buy_score={buy_score} confidence={conf} position_ratio={ratio*100:.0f}% reason={reason}"
         elif evidence_validation.get("status") == "warn":
             conf = max(0, conf - 5)
             decision_text = f"[{decision_source}] signal={sig} buy_score={buy_score} confidence={conf} position_ratio={ratio*100:.0f}% reason={reason}"
+
+    if evidence_validation.get("status") == "fail":
+        errors = evidence_validation.get("errors") or ["未知证据错误"]
+        logger.warning("[%s] PM最终证据仍未通过，标记节点待重试: %s", stock_name, errors)
+        raise RoleEvidenceValidationError(
+            "基金经理证据校验失败: " + "；".join(str(item) for item in errors)
+        )
 
     # ── 聚合各节点实际跑的模型（用于早报卡片真实显示）──
     # 同一节点多次出现时只保留最后一次（辩论多轮），按节点出现顺序输出
@@ -2084,6 +3071,10 @@ def portfolio_manager_node(state: RiskDebateState) -> RiskDebateState:
         buy_score=buy_score,
         confidence=conf,
         position_ratio=ratio,
+        allow_direct_buy=allow_direct_buy,
+        needs_intraday_confirmation=needs_intraday_confirmation,
+        entry_condition=entry_condition,
+        block_buy_reason=block_buy_reason,
         reason=reason,
         decision_source=decision_source,
         raw_final_decision=raw_final_decision,
@@ -2114,6 +3105,10 @@ def rerun_portfolio_manager_from_checkpoint(result: Dict[str, Any]) -> Optional[
         "signal": result.get("signal", "WATCH"),
         "confidence": int(result.get("confidence") or 0),
         "position_ratio": 0.0,
+        "allow_direct_buy": False,
+        "needs_intraday_confirmation": True,
+        "entry_condition": result.get("entry_condition", "盘中重新确认"),
+        "block_buy_reason": result.get("block_buy_reason", "断点重跑基金经理裁决"),
         "reason": result.get("reason", ""),
         "decision_source": result.get("decision_source", ""),
         "raw_final_decision": result.get("raw_final_decision", ""),
@@ -2159,6 +3154,10 @@ def merge_to_risk_state(invest_state: InvestDebateState) -> RiskDebateState:
         "signal": "WATCH",
         "confidence": 50,
         "position_ratio": 0.15,
+        "allow_direct_buy": False,
+        "needs_intraday_confirmation": True,
+        "entry_condition": "盘中确认",
+        "block_buy_reason": "默认观察",
         "reason": "",
         "decision_source": "",
         "raw_final_decision": "",
@@ -2169,6 +3168,11 @@ def merge_to_risk_state(invest_state: InvestDebateState) -> RiskDebateState:
         "evidence_validation": {},
         "model": invest_state.get("model", DEFAULT_MODEL),
         "data_quality_flags": invest_state.get("data_quality_flags", []),
+        "tech_pattern_score": invest_state.get("tech_pattern_score", 50),
+        "tech_rule_signal": invest_state.get("tech_rule_signal", "WATCH"),
+        "tech_raw_score": invest_state.get("tech_raw_score", invest_state.get("tech_pattern_score", 50)),
+        "tech_max_score": invest_state.get("tech_max_score", 100),
+        "tech_veto_reasons": invest_state.get("tech_veto_reasons", []),
         "node_models_log": invest_state.get("node_models_log", []),
         "decision_models": {},
     }
@@ -2180,10 +3184,10 @@ def _build_invest_debate_graph(checkpointer):
     """构建阶段1（投资辩论）的 LangGraph。"""
     g = StateGraph(InvestDebateState)
 
-    g.add_node("bull_researcher", bull_researcher_node)
-    g.add_node("bear_researcher", bear_researcher_node)
-    g.add_node("tech_analyst", tech_analyst_node)
-    g.add_node("research_manager", research_manager_node)
+    g.add_node("bull_researcher", _checkpointed_node("invest", "bull_researcher", bull_researcher_node))
+    g.add_node("bear_researcher", _checkpointed_node("invest", "bear_researcher", bear_researcher_node))
+    g.add_node("tech_analyst", _checkpointed_node("invest", "tech_analyst", tech_analyst_node))
+    g.add_node("research_manager", _checkpointed_node("invest", "research_manager", research_manager_node))
 
     g.set_entry_point("bull_researcher")
 
@@ -2214,10 +3218,10 @@ def _build_risk_debate_graph(checkpointer):
     """构建阶段2（风险辩论）的 LangGraph。"""
     g = StateGraph(RiskDebateState)
 
-    g.add_node("aggressive_analyst", aggressive_analyst_node)
-    g.add_node("conservative_analyst", conservative_analyst_node)
-    g.add_node("neutral_analyst", neutral_analyst_node)
-    g.add_node("portfolio_manager", portfolio_manager_node)
+    g.add_node("aggressive_analyst", _checkpointed_node("risk", "aggressive_analyst", aggressive_analyst_node))
+    g.add_node("conservative_analyst", _checkpointed_node("risk", "conservative_analyst", conservative_analyst_node))
+    g.add_node("neutral_analyst", _checkpointed_node("risk", "neutral_analyst", neutral_analyst_node))
+    g.add_node("portfolio_manager", _checkpointed_node("risk", "portfolio_manager", portfolio_manager_node))
 
     g.set_entry_point("aggressive_analyst")
 
@@ -2290,6 +3294,8 @@ class StockDebateEngine:
         max_parallel: int = 3,  # ★ 6-04 老板拍板：ark-code 无 QPS 限流（不像 MiniMax 有 Semaphore(3)），并发 ≤ 3 防 5-hour quota 熔断
         top_n: Optional[int] = None,
         checkpoint_cb: Optional[callable] = None,
+        node_checkpoint_cb: Optional[callable] = None,
+        resume_node_states: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
     ) -> List[Dict]:
         """
         对候选股票池运行完整辩论流程。
@@ -2302,6 +3308,7 @@ class StockDebateEngine:
             top_n: 最多辩论股数（默认None=全部候选股进入辩论）
         """
         stock_scores = stock_scores or {}
+        resume_node_states = resume_node_states or {}
 
         # 按 Phase1 评分排序，top_n=None 表示全部进入辩论
         sorted_packets = sorted(
@@ -2323,13 +3330,41 @@ class StockDebateEngine:
             return _cb
 
         _checkpoint_cb = make_checkpoint_cb()
+        _node_cp_lock = threading.Lock()
+
+        def _node_cb(code: str, node_key: str, state_snapshot: Dict[str, Any]) -> None:
+            if not node_checkpoint_cb:
+                return
+            with _node_cp_lock:
+                node_checkpoint_cb(code, node_key, state_snapshot)
 
         def run_one(packet: Dict) -> Dict:
             code = packet.get("stock_code", "N/A")
             name = packet.get("name", packet.get("stock_name", code))
             phase1_score = stock_scores.get(code, 0)
+            stock_resume_nodes = dict(resume_node_states.get(code, {}) or {})
+
+            def _stock_node_cb(
+                callback_code: str,
+                node_key: str,
+                state_snapshot: Dict[str, Any],
+            ) -> None:
+                # Keep the just-completed node available to retries in this
+                # same process.  Otherwise a later evidence failure restarts
+                # the stock from its first Bull node even though that node was
+                # already durably checkpointed.
+                stock_resume_nodes[node_key] = dict(state_snapshot)
+                _node_cb(callback_code, node_key, state_snapshot)
+
             try:
-                result = self._run_single(code, name, packet, market_context)
+                _NODE_CHECKPOINT_LOCAL.callback = _stock_node_cb
+                result = self._run_single(
+                    code,
+                    name,
+                    packet,
+                    market_context,
+                    resume_nodes=stock_resume_nodes,
+                )
                 result["phase1_score"] = phase1_score
                 if _checkpoint_cb:
                     _checkpoint_cb(code, result)
@@ -2349,6 +3384,8 @@ class StockDebateEngine:
                     "data_quality_flags": flags,
                     "phase1_score": phase1_score,
                 }
+            finally:
+                _NODE_CHECKPOINT_LOCAL.callback = None
 
         # 分批执行，每批10个，批次间隔5秒
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -2395,8 +3432,11 @@ class StockDebateEngine:
         stock_name: str,
         packet: Dict,
         market_context: str,
+        resume_nodes: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Dict:
         """对单只股票运行完整两阶段辩论。"""
+
+        resume_nodes = resume_nodes if isinstance(resume_nodes, dict) else {}
 
         # ── 阶段1：投资辩论 ──────────────────────────────
         invest_initial: InvestDebateState = {
@@ -2413,6 +3453,7 @@ class StockDebateEngine:
             "max_rounds": self.max_debate_rounds,
             "model": self.model,
             "node_models_log": [],
+            "_node_resume": resume_nodes,
         }
 
         # 运行投资辩论图（使用 checkpointer 支持断点）
@@ -2420,7 +3461,7 @@ class StockDebateEngine:
         for attempt in range(3):
             try:
                 invest_state = self._invest_graph.invoke(
-                    invest_initial,
+                    invest_initial if attempt == 0 else None,
                     config={"configurable": {"thread_id": f"invest_{stock_code}"}},
                 )
                 break
@@ -2432,12 +3473,13 @@ class StockDebateEngine:
 
         # ── 阶段2：风险辩论 ──────────────────────────────
         risk_initial = merge_to_risk_state(invest_state)
+        risk_initial["_node_resume"] = resume_nodes
 
         risk_state = None
         for attempt in range(3):
             try:
                 risk_state = self._risk_graph.invoke(
-                    risk_initial,
+                    risk_initial if attempt == 0 else None,
                     config={"configurable": {"thread_id": f"risk_{stock_code}"}},
                 )
                 break
@@ -2473,6 +3515,17 @@ class StockDebateEngine:
             "sector": packet.get("sector", ""),
             "money_flow": packet.get("money_flow", {}),
             "data_contract": packet.get("data_contract", {}),
+            "verified_market_snapshot": packet.get("verified_market_snapshot", {}),
+            "market_snapshot_version": packet.get("market_snapshot_version", ""),
+            "data_router_version": packet.get("data_router_version", ""),
+            "data_router_summary": packet.get("data_router_summary", {}),
+            "debate_rounds": self.max_debate_rounds,
+            "knowledge_rule_hits": packet.get("knowledge_rule_hits", []),
+            "knowledge_rule_score_adjustment": packet.get("knowledge_rule_score_adjustment", 0),
+            "knowledge_rule_summary": packet.get("knowledge_rule_summary", ""),
+            "knowledge_rule_watch_only": packet.get("knowledge_rule_watch_only", False),
+            "knowledge_rule_hard_blocker": packet.get("knowledge_rule_hard_blocker", False),
+            "knowledge_rule_version": packet.get("knowledge_rule_version", ""),
             "data_quality_flags": list(dict.fromkeys(
                 (packet.get("data_quality_flags", []) or [])
                 + (invest_state.get("data_quality_flags", []) or [])
@@ -2482,6 +3535,10 @@ class StockDebateEngine:
             "buy_score": risk_state.get("buy_score", _fallback_buy_score(risk_state.get("signal", "WATCH"), risk_state.get("confidence", 50))),
             "confidence": risk_state.get("confidence", 50),
             "position_ratio": risk_state.get("position_ratio", 0.15),
+            "allow_direct_buy": risk_state.get("allow_direct_buy"),
+            "needs_intraday_confirmation": risk_state.get("needs_intraday_confirmation"),
+            "entry_condition": risk_state.get("entry_condition", ""),
+            "block_buy_reason": risk_state.get("block_buy_reason", ""),
             "reason": risk_state.get("reason", ""),
             "decision_source": risk_state.get("decision_source", ""),
             "raw_final_decision": risk_state.get("raw_final_decision", ""),

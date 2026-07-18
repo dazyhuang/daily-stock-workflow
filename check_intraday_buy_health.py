@@ -19,8 +19,9 @@ from typing import Any
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "output"
 LOG_DIR = BASE_DIR / "logs"
-CRON_JOBS_FILE = Path("~/.openclaw/cron/jobs.json.migrated")
-CRON_DB_FILE = Path("~/.openclaw/state/openclaw.sqlite")
+OPENCLAW_HOME = Path(os.environ.get("OPENCLAW_HOME", Path.home() / ".openclaw"))
+CRON_JOBS_FILE = Path(os.environ.get("OPENCLAW_CRON_JOBS_FILE", OPENCLAW_HOME / "cron" / "jobs.json.migrated"))
+CRON_DB_FILE = Path(os.environ.get("OPENCLAW_CRON_DB_FILE", OPENCLAW_HOME / "state" / "openclaw.sqlite"))
 EXPECTED_START_TIME = dt_time(9, 25)
 
 
@@ -61,7 +62,7 @@ def _effective_intraday_buy_models(env_values: dict[str, tuple[str, str]]) -> di
         primary = env_values.get("INTRADAY_LLM_MODEL", ("minimax-portal/MiniMax-M3", "default"))
     fallback = env_values.get("INTRADAY_BUY_TIMING_LLM_FALLBACK_MODEL")
     if not fallback or not fallback[0]:
-        fallback = env_values.get("INTRADAY_LLM_FALLBACK_MODEL", ("openai-codex/gpt-5.5", "default"))
+        fallback = env_values.get("INTRADAY_LLM_FALLBACK_MODEL", ("openai/gpt-5.6-sol", "default"))
     return {"primary": primary, "fallback": fallback}
 
 
@@ -600,7 +601,7 @@ def run_checks(day_key: str) -> list[Check]:
     model_config = _effective_intraday_buy_models(env_values)
     expected_models = {
         "primary": "minimax-portal/MiniMax-M3",
-        "fallback": "openai-codex/gpt-5.5",
+        "fallback": "openai/gpt-5.6-sol",
     }
     model_hits = []
     for role, expected in expected_models.items():

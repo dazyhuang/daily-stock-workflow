@@ -7,6 +7,7 @@ full workflow.
 """
 
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -20,7 +21,6 @@ from typing import Iterator
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "output"
 WORKFLOW = BASE_DIR / "workflow.py"
-LOCK_STALE_SECONDS = int(os.getenv("DAILY_STOCK_WORKFLOW_LOCK_STALE_SECONDS", str(12 * 3600)))
 
 
 def _today() -> str:
@@ -29,6 +29,10 @@ def _today() -> str:
 
 def _report_path() -> Path:
     return OUTPUT_DIR / f"daily_report_{_today()}.json"
+
+
+def _push_marker_path() -> Path:
+    return OUTPUT_DIR / f"daily_report_push_{_today()}.json"
 
 
 def _checkpoint_path() -> Path:
@@ -72,9 +76,73 @@ def _checkpoint_matches_today() -> bool:
     return isinstance(data, dict) and data.get("date") == _today()
 
 
+def _phase1_context_matches_today() -> bool:
+    phase1_file = _phase1_context_path()
+    if not phase1_file.exists() or not _is_mtime_today(phase1_file):
+        return False
+    try:
+        data = json.loads(phase1_file.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return isinstance(data, list) and any(
+        isinstance(item, dict) and item.get("status") == "success"
+        for item in data
+    )
+
+
+def _resume_state_kind() -> str:
+    if _checkpoint_matches_today():
+        return "checkpoint"
+    if _phase1_context_matches_today():
+        return "phase1"
+    return ""
+
+
 def _resume_state_available() -> bool:
     """Return True when today has enough state to continue, not restart."""
-    return _checkpoint_matches_today()
+    return bool(_resume_state_kind())
+
+
+def _report_is_complete(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(data, dict) or data.get("status") != "success":
+        return False
+    report_day = str(data.get("date") or "").replace("-", "")[:8]
+    if report_day != _today():
+        return False
+    picks = ((data.get("phase2") or {}).get("top_picks") or [])
+    if len(picks) != 5:
+        return False
+    artifacts = data.get("artifacts") or {}
+    for key in ("candidates_jsonl", "trace_json", "summary_json"):
+        artifact = artifacts.get(key)
+        if not artifact or not Path(artifact).exists():
+            return False
+
+    push_marker = _push_marker_path()
+    if not push_marker.exists():
+        return False
+    try:
+        push_data = json.loads(push_marker.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if (
+        not isinstance(push_data, dict)
+        or push_data.get("date") != date.today().isoformat()
+        or push_data.get("status") != "success"
+        or push_data.get("top_picks_count") != 5
+    ):
+        return False
+    payload = json.dumps(data, ensure_ascii=False, sort_keys=True, default=str)
+    report_digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    if push_data.get("report_digest") != report_digest:
+        return False
+    return True
 
 
 def _pid_alive(pid) -> bool:
@@ -135,15 +203,7 @@ def _workflow_singleton_lock() -> Iterator[bool]:
                 print(f"已有今日选股工作流实例正在运行: pid={pid}, started_at={owner.get('started_at')}")
                 yield False
                 return
-            try:
-                age = time.time() - lock_dir.stat().st_mtime
-            except FileNotFoundError:
-                continue
-            if age < LOCK_STALE_SECONDS:
-                print(f"发现无存活PID但尚未过期的工作流锁，暂不抢占: {owner}", file=sys.stderr)
-                yield False
-                return
-            print(f"发现过期工作流锁，准备清理后重试: {owner}", file=sys.stderr)
+            print(f"发现锁记录中的PID已不存活，立即清理后继续: {owner}", file=sys.stderr)
             if not _remove_lock_dir(lock_dir):
                 yield False
                 return
@@ -182,16 +242,22 @@ def _run(label: str, args: list[str]) -> int:
     env = os.environ.copy()
     _load_dotenv_into(env)
     env["PYTHONUNBUFFERED"] = "1"
-    env.setdefault("OPENCLAW_WORKSPACE", "./workspace")
+    env.setdefault("OPENCLAW_WORKSPACE", ".")
     env.setdefault("DAILY_STOCK_WORKFLOW_SEND_FEISHU", "1")
     env.setdefault("TA_DEFAULT_MODEL", "volcengine-plan/ark-code-latest")
-    env.setdefault("TA_FALLBACK_MODEL", "openai/gpt-5.5")
+    env.setdefault("TA_FALLBACK_MODEL", "openai/gpt-5.6-sol")
     env.setdefault("TA_SECONDARY_FALLBACK_MODEL", "minimax-portal/MiniMax-M3")
-    env.setdefault("TA_THINKING_BUDGET_VOLCAN", "16000")
+    env.setdefault("TA_ROLE_MAX_TOKENS", "12288")
+    env.setdefault("TA_THINKING_BUDGET_VOLCAN", "8192")
     env.setdefault("TECH_ANALYST_MODEL", "volcengine-plan/ark-code-latest")
-    env.setdefault("TECH_ANALYST_FALLBACK_MODEL", "openai/gpt-5.5")
-    env.setdefault("PORTFOLIO_MANAGER_SECONDARY_MODEL", "minimax-portal/MiniMax-M3")
+    env.setdefault("TECH_ANALYST_FALLBACK_MODEL", "openai/gpt-5.6-sol")
+    env.setdefault("PORTFOLIO_MANAGER_PRIMARY_MODEL", "openai/gpt-5.6-sol")
+    env.setdefault("PORTFOLIO_MANAGER_PRIMARY_REASONING_EFFORT", "max")
+    env.setdefault("PORTFOLIO_MANAGER_TIMEOUT", "300")
+    env.setdefault("PORTFOLIO_MANAGER_SECONDARY_MODEL", "openai/gpt-5.6-sol")
+    env.setdefault("PORTFOLIO_MANAGER_SECONDARY_REASONING_EFFORT", "max")
     env.setdefault("PORTFOLIO_MANAGER_SECONDARY_FALLBACK_MODEL", "")
+    env.setdefault("PORTFOLIO_MANAGER_TERTIARY_MODEL", "minimax-portal/MiniMax-M3")
     env.setdefault("MINIMAX_ALLOW_MX_DIRECT_KEY", "1")
     env["DAILY_STOCK_WORKFLOW_LOCK_HELD"] = "1"
     proc = subprocess.Popen(
@@ -286,9 +352,13 @@ def main() -> int:
         if not acquired:
             return 0
         report_file = _report_path()
-        if not report_file.exists():
-            if _resume_state_available():
-                print("发现今日断点，直接从 checkpoint resume，避免重新启动完整选股工作流")
+        if not _report_is_complete(report_file):
+            if report_file.exists():
+                print("今日已有报告但状态、Top5或配套产物不完整，继续修复而不是判定成功")
+            resume_kind = _resume_state_kind()
+            if resume_kind:
+                label = "辩论 checkpoint" if resume_kind == "checkpoint" else "Phase 1 上下文"
+                print(f"发现今日{label}，从已有状态续跑，避免重新启动完整选股工作流")
                 env_model = os.environ.get("TA_DEFAULT_MODEL", "volcengine-plan/ark-code-latest")
                 os.environ.setdefault("TA_DEFAULT_MODEL", env_model)
                 rc = _run("resume", ["--model", env_model, "--resume"])
@@ -299,15 +369,15 @@ def main() -> int:
                 if rc == 137:
                     # ★ 6-04 老板拍板：watchdog 主动 kill（10 分钟没进展）→ 立即走 resume，不需重跑 normal
                     print(f"[WATCHDOG] normal 被 watchdog kill（rc=137），检查 checkpoint 后决定是否 resume")
-                if (rc != 0 or not report_file.exists()) and _resume_state_available():
-                    print(f"normal 未生成今日报告，开始 checkpoint resume；normal rc={rc}")
+                if (rc != 0 or not _report_is_complete(report_file)) and _resume_state_available():
+                    print(f"normal 未生成今日报告，开始从已保存状态续跑；normal rc={rc}")
                     rc = _run("resume", ["--model", env_model, "--resume"])
-            if rc != 0 and not report_file.exists():
-                print(f"工作流失败，且未生成今日报告；resume rc={rc}", file=sys.stderr)
+            if rc != 0 and not _report_is_complete(report_file):
+                print(f"工作流失败，且未生成完整今日报告；续跑 rc={rc}", file=sys.stderr)
                 return rc or 1
 
-        if not report_file.exists():
-            print("工作流结束但未找到今日报告", file=sys.stderr)
+        if not _report_is_complete(report_file):
+            print("工作流结束但今日报告仍不完整", file=sys.stderr)
             return 1
         print("\n" + _summary(report_file))
         return 0

@@ -22,14 +22,17 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Any, Optional
 
-logger = logging.getLogger("stock_selection_debate.data_fetcher")
+# Use the workflow logger hierarchy so prefetch progress reaches the stable
+# runner's stdout/file handlers and counts as watchdog activity.
+logger = logging.getLogger("daily_stock_workflow.data_fetcher")
 CACHE_DIR = Path(__file__).parent.parent / "output" / "data_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from domestic_network import domestic_subprocess_env, request_direct, retry_call  # noqa: E402
+from stock_selection_debate.technical_indicators import compute_macd, legacy_macd_signal  # noqa: E402
 
 # 辩论信号套件（蜡烛图、量价背离、海龟、波浪、江恩）
 DEBATE_SIGNAL_KITS_DIR = Path(__file__).parent.parent / "debate_signal_kits"
@@ -81,6 +84,10 @@ class _MXMoneyFlowTooFrequent(RuntimeError):
     pass
 
 
+class _MXMoneyFlowAuthError(RuntimeError):
+    pass
+
+
 def _data_result(
     *,
     source: str,
@@ -88,14 +95,26 @@ def _data_result(
     error: str = "",
     quality_flags: Optional[List[str]] = None,
     as_of: Optional[str] = None,
+    age_minutes: Optional[int] = None,
+    is_stale: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Small data-access contract used by reports without changing legacy fields."""
+    resolved_as_of = as_of or ""
+    as_of_key = re.sub(r"\D", "", str(resolved_as_of or ""))[:8]
+    stale = bool(is_stale) if is_stale is not None else False
+    flags = _uniq_keep_order(quality_flags or [])
+    resolved_status = status
+    if resolved_status == "ok" and not as_of_key:
+        resolved_status = "partial"
+        flags = _uniq_keep_order(flags + ["DATE_UNKNOWN"])
     return {
         "source": source or "none",
-        "status": status,
+        "status": resolved_status,
         "error": str(error or "")[:300],
-        "as_of": as_of or date.today().strftime("%Y%m%d"),
-        "quality_flags": _uniq_keep_order(quality_flags or []),
+        "as_of": resolved_as_of,
+        "age_minutes": age_minutes,
+        "is_stale": stale,
+        "quality_flags": flags,
     }
 
 
@@ -185,13 +204,40 @@ def _get_cached_sector(stock_code: str) -> str:
     return str(item.get("sector", "") or "")
 
 
-def _set_cached_sector(stock_code: str, sector: str) -> None:
+def _get_cached_sector_as_of(stock_code: str) -> str:
+    cache = _load_json_cache(_sector_cache_path(), {})
+    item = cache.get(str(stock_code).zfill(6), {})
+    return str(item.get("updated", "") or "")
+
+
+def _get_fresh_cached_sector(stock_code: str, max_age_days: int = 30) -> tuple[str, str]:
+    sector = _get_cached_sector(stock_code)
+    as_of = _get_cached_sector_as_of(stock_code)
+    if not sector or not as_of:
+        return "", as_of
+    try:
+        observed = datetime.strptime(re.sub(r"\D", "", as_of)[:8], "%Y%m%d").date()
+        if (date.today() - observed).days > max_age_days:
+            return "", as_of
+    except Exception:
+        return "", as_of
+    return sector, as_of
+
+
+def _set_cached_sector(
+    stock_code: str,
+    sector: str,
+    *,
+    source: str = "verified",
+    as_of: str = "",
+) -> None:
     if not sector:
         return
     cache = _load_json_cache(_sector_cache_path(), {})
     cache[str(stock_code).zfill(6)] = {
         "sector": sector,
-        "updated": date.today().strftime("%Y%m%d"),
+        "updated": _normalize_kline_date(as_of, dashed=False) or date.today().strftime("%Y%m%d"),
+        "source": source,
     }
     _save_json_cache(_sector_cache_path(), cache)
 
@@ -357,7 +403,11 @@ def _fetch_news_via_mxsearch(stock_name: str, max_results: int = 5) -> List[Dict
     import requests
     url = "https://mkapi2.dfcfs.com/finskillshub/api/claw/news-search"
     headers = {"Content-Type": "application/json", "apikey": api_key}
-    query = f"{stock_name} 2026年5月"
+    today = date.today()
+    query = (
+        f"{stock_name} 最新公告 重大消息 近7天 "
+        f"截至{today.strftime('%Y-%m-%d')}"
+    )
     try:
         resp = retry_call(
             f"mx-search {stock_name}",
@@ -406,6 +456,120 @@ def _ensure_suffix(code: str) -> str:
     return code + ".SZ"
 
 
+_FINANCIAL_FIELD_ALIASES = {
+    "roe_annual_latest": ("roe_annual_latest", "roe", "ROE"),
+    "roe_quarter_latest": ("roe_quarter_latest", "roe_quarter"),
+    "revenue_growth_yoy": ("revenue_growth_yoy", "revenue_growth", "营收增速", "营业收入同比增长"),
+    "net_profit_growth_yoy": ("net_profit_growth_yoy", "net_profit_growth", "净利润增长率", "净利润同比增长"),
+    "gross_margin": ("gross_margin", "毛利率", "销售毛利率"),
+    "debt_asset_ratio": ("debt_asset_ratio", "debt_ratio", "负债率", "资产负债率"),
+    "pe_ttm": ("pe_ttm", "pe", "市盈率"),
+    "pb": ("pb", "市净率"),
+    "total_market_cap": ("total_market_cap", "market_cap", "总市值"),
+    "operating_cash_flow": ("operating_cash_flow", "cash_flow", "经营现金流"),
+    "book_value_per_share": ("book_value_per_share", "每股净资产"),
+    "sector": ("sector", "industry", "行业", "所属行业"),
+    "_as_of": ("_as_of", "report_date", "end_date", "m_timetag"),
+}
+
+
+def normalize_financial_record(record: Optional[Dict]) -> Dict:
+    """保留原字段，并补齐 Phase 2 使用的统一财务字段名。"""
+    if not isinstance(record, dict):
+        return {}
+    normalized = dict(record)
+    for canonical, aliases in _FINANCIAL_FIELD_ALIASES.items():
+        for field in aliases:
+            value = record.get(field)
+            if value is not None and value != "":
+                normalized[canonical] = value
+                break
+    return normalized
+
+
+def _parse_ddx_ddy_tables(tables: Any) -> tuple[Optional[float], Optional[float], List[str]]:
+    """Parse only explicit 5-day DDX and 10-day DDY fields."""
+    ddx_value: Optional[float] = None
+    ddy_value: Optional[float] = None
+    ddx_priority = -1
+    ddy_priority = -1
+    observed_columns: List[str] = []
+
+    def parse_index(raw: Any) -> Optional[float]:
+        if raw in (None, ""):
+            return None
+        try:
+            text = str(raw).strip().replace(",", "").replace("%", "")
+            if text.lower() in {"nan", "none", "--", "-"}:
+                return None
+            return round(float(text), 4)
+        except (TypeError, ValueError):
+            return None
+
+    for table in tables or []:
+        if not isinstance(table, dict):
+            continue
+        for row in table.get("rows", []) or []:
+            if not isinstance(row, dict):
+                continue
+            row_label = " ".join(
+                str(value).strip()
+                for value in row.values()
+                if value not in (None, "") and parse_index(value) is None
+            )
+            row_numbers = [
+                parse_index(value)
+                for value in row.values()
+                if parse_index(value) is not None
+            ]
+            for raw_key, raw_value in row.items():
+                key = str(raw_key).strip()
+                if key and key not in observed_columns:
+                    observed_columns.append(key)
+                normalized = re.sub(r"[\s_\-()（）\[\]：:]", "", key).upper()
+                value = parse_index(raw_value)
+                if value is None:
+                    continue
+                if "DDX" in normalized and any(x in normalized for x in ("5日", "DDX5", "5DDX")):
+                    if 3 > ddx_priority:
+                        ddx_value, ddx_priority = value, 3
+                if "DDY" in normalized and any(x in normalized for x in ("10日", "DDY10", "10DDY")):
+                    if 3 > ddy_priority:
+                        ddy_value, ddy_priority = value, 3
+            normalized_label = re.sub(r"[\s_\-()（）\[\]：:]", "", row_label).upper()
+            if row_numbers and "DDX" in normalized_label and any(
+                x in normalized_label for x in ("5日", "DDX5", "5DDX")
+            ):
+                if 3 > ddx_priority:
+                    ddx_value, ddx_priority = row_numbers[-1], 3
+            if row_numbers and "DDY" in normalized_label and any(
+                x in normalized_label for x in ("10日", "DDY10", "10DDY")
+            ):
+                if 3 > ddy_priority:
+                    ddy_value, ddy_priority = row_numbers[-1], 3
+    return ddx_value, ddy_value, observed_columns
+
+
+def _financial_record_has_any_value(record: Optional[Dict]) -> bool:
+    normalized = normalize_financial_record(record)
+    return any(
+        normalized.get(field) is not None and normalized.get(field) != ""
+        for field in (
+            "roe_annual_latest",
+            "roe_quarter_latest",
+            "revenue_growth_yoy",
+            "net_profit_growth_yoy",
+            "gross_margin",
+            "debt_asset_ratio",
+            "pe_ttm",
+            "pb",
+            "total_market_cap",
+            "operating_cash_flow",
+            "book_value_per_share",
+        )
+    )
+
+
 def _fetch_financial_via_xqshare(stock_code: str) -> Optional[Dict]:
     """
     通过 QMT HTTP API 获取单只股票财务数据
@@ -414,7 +578,7 @@ def _fetch_financial_via_xqshare(stock_code: str) -> Optional[Dict]:
     try:
         import urllib.request, json
         full_code = _ensure_suffix(stock_code)
-        url = f"http://127.0.0.1:8080/financial_data?stocks={full_code}&tables=PERSHAREINDEX"
+        url = f"{QMT_HTTP_URL}/financial_data?stocks={full_code}&tables=PERSHAREINDEX"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             raw = json.loads(resp.read().decode("utf-8"))
@@ -463,7 +627,7 @@ def _fetch_financial_via_xqshare(stock_code: str) -> Optional[Dict]:
             eps = get_val(annual_row, "s_fa_eps_basic")
             bps = get_val(quarter_row, "s_fa_bps") if quarter_row else None
             if eps and eps > 0:
-                price_url = f"http://127.0.0.1:8080/market_data3?stock={full_code}&period=1d&count=1"
+                price_url = f"{QMT_HTTP_URL}/market_data3?stock={full_code}&period=1d&count=1"
                 preq = urllib.request.Request(price_url, headers={"User-Agent": "Mozilla/5.0"})
                 with urllib.request.urlopen(preq, timeout=10) as pr:
                     pd_data = json.loads(pr.read().decode("utf-8"))
@@ -487,6 +651,10 @@ def _fetch_financial_via_xqshare(stock_code: str) -> Optional[Dict]:
             "debt_asset_ratio": get_val(annual_row, "gear_ratio") if annual_row else None,
             "pe_ttm": pe,
             "pb": pb,
+            "_as_of": _normalize_kline_date(
+                quarter_row[col_idx["m_timetag"]] if quarter_row and "m_timetag" in col_idx else "",
+                dashed=False,
+            ),
         }
     except Exception as e:
         logger.warning(f"QMT HTTP 财务获取失败 {stock_code}: {e}")
@@ -528,6 +696,13 @@ def _fetch_money_flow_via_mx(stock_code: str) -> Optional[Dict]:
                     raise _MXMoneyFlowTooFrequent(str(err))
                 if "状态码 113" in str(err) or "调用次数已达" in str(err):
                     raise _MXMoneyFlowRateLimited(str(err))
+                if (
+                    "状态码 114" in str(err)
+                    or "API密钥不存在" in str(err)
+                    or "API密钥失效" in str(err)
+                    or "api key" in str(err).lower()
+                ):
+                    raise _MXMoneyFlowAuthError(str(err))
                 logger.debug(f"{label} parse empty: {err}")
                 return []
             tables = parsed[0]
@@ -557,7 +732,7 @@ def _fetch_money_flow_via_mx(stock_code: str) -> Optional[Dict]:
             allow_symbol_fallback: bool = True,
         ) -> Optional[float]:
             for key in preferred_keys:
-                if key in row and row.get(key):
+                if key in row and row.get(key) not in (None, ""):
                     value = parse_yi(str(row.get(key)))
                     if value is not None:
                         return value
@@ -587,6 +762,8 @@ def _fetch_money_flow_via_mx(stock_code: str) -> Optional[Dict]:
             super_net_flow = None
             ddx_5 = None
             ddy_10 = None
+            ddx_ddy_columns: List[str] = []
+            as_of = ""
 
             # ── 查询1：主力净流入 + 超大单 ────────────────────────
             result = mx_query(f"{code6} 主力净流入资金 主力净额")
@@ -597,6 +774,8 @@ def _fetch_money_flow_via_mx(stock_code: str) -> Optional[Dict]:
                 for row in (t.get("rows", []) or []):
                     if not isinstance(row, dict):
                         continue
+                    if not as_of and row.get("date"):
+                        as_of = _normalize_kline_date(row.get("date"), dashed=False)
                     if main_net_flow is None:
                         main_net_flow = pick_money_value(row, ["主力净流入资金", "主力净流入", "主力净额", "净额"])
                     if super_net_flow is None:
@@ -609,28 +788,15 @@ def _fetch_money_flow_via_mx(stock_code: str) -> Optional[Dict]:
             # ── 查询2：DDX/DDY 指标（用DDX DDX查询，返回所有DDX/DDY字段）──
             result2 = mx_query(f"{code6} DDX DDY")
             tables2 = parse_tables(result2, "mx ddx query")
-            for t in (tables2 or []):
-                if not isinstance(t, dict):
-                    continue
-                for row in (t.get("rows", []) or []):
-                    if not isinstance(row, dict):
-                        continue
-                    if ddx_5 is None:
-                        for k in ["5日DDX", "当日DDX"]:
-                            if k in row and row[k]:
-                                try:
-                                    ddx_5 = round(float(str(row[k]).replace(',', '')), 3)
-                                    break
-                                except (ValueError, AttributeError):
-                                    pass
-                    if ddy_10 is None:
-                        for k in ["10日DDY", "当日DDY"]:
-                            if k in row and row[k]:
-                                try:
-                                    ddy_10 = round(float(str(row[k]).replace(',', '')), 3)
-                                    break
-                                except (ValueError, AttributeError):
-                                    pass
+            ddx_5, ddy_10, ddx_ddy_columns = _parse_ddx_ddy_tables(tables2)
+            if ddx_5 is None or ddy_10 is None:
+                logger.info(
+                    "mx-data DDX/DDY辅助字段不完整 %s: ddx_5=%s ddy_10=%s columns=%s",
+                    code6,
+                    ddx_5,
+                    ddy_10,
+                    ddx_ddy_columns[:20],
+                )
 
             # ── 查询3：补充超大单（如缺失）─────────────────────────
             if super_net_flow is None:
@@ -651,6 +817,14 @@ def _fetch_money_flow_via_mx(stock_code: str) -> Optional[Dict]:
                 "super_net_flow": super_net_flow,  # 亿元
                 "ddx_5": ddx_5,                    # 5日DDX（主力关注度）
                 "ddy_10": ddy_10,                  # 10日DDY（趋势强度）
+                "source": "mx-data",
+                "as_of": as_of,
+                "aux_checked": True,
+                "diagnostics": {
+                    "ddx_ddy_columns": ddx_ddy_columns[:30],
+                    "ddx_missing_after_parse": ddx_5 is None,
+                    "ddy_missing_after_parse": ddy_10 is None,
+                },
             }
 
         retries = _env_int("MX_MONEY_FLOW_112_RETRIES", 3, minimum=0)
@@ -703,6 +877,23 @@ def _fetch_money_flow_via_mx(stock_code: str) -> Optional[Dict]:
             _MX_MONEY_FLOW_DISABLED_UNTIL = time.monotonic() + cooldown_sec
         logger.warning(f"mx-data 资金流触发限流熔断: 冷却{cooldown_sec}s, {stock_code}: {e}")
         return {}
+    except _MXMoneyFlowAuthError as e:
+        cooldown_sec = _env_int("MX_MONEY_FLOW_AUTH_COOLDOWN_SEC", 1800, minimum=60)
+        with _MX_MONEY_FLOW_LOCK:
+            _MX_MONEY_FLOW_FAIL_STREAK += 1
+            _MX_MONEY_FLOW_DISABLED_UNTIL = time.monotonic() + cooldown_sec
+        logger.error(f"mx-data 资金流认证失败: 冷却{cooldown_sec}s, {stock_code}: {e}")
+        return {
+            "main_net_flow": None,
+            "super_net_flow": None,
+            "ddx_5": None,
+            "ddy_10": None,
+            "source": "mx-data",
+            "status": "auth_error",
+            "error": str(e),
+            "aux_checked": False,
+            "diagnostics": {"auth_error": True},
+        }
     except Exception as e:
         cooldown_sec = _env_int("MX_MONEY_FLOW_COOLDOWN_SEC", 900, minimum=30)
         threshold = _env_int("MX_MONEY_FLOW_FAIL_THRESHOLD", 3, minimum=1)
@@ -768,8 +959,14 @@ def _fetch_money_flow_via_akshare(stock_code: str) -> Dict:
             return {}
 
 
-        # 最新1条：主力净流入、超大单净流入
-        latest = df.iloc[0]
+        date_col = next((c for c in df.columns if str(c) in {"日期", "date", "交易日期"}), None)
+        ordered = df.copy()
+        if date_col:
+            ordered["__date"] = pd.to_datetime(ordered[date_col], errors="coerce")
+            ordered = ordered.sort_values("__date")
+
+        # 使用真实最新交易日，并从同一有序序列计算累计主力净流入。
+        latest = ordered.iloc[-1]
         main_net = latest.get("主力净流入-净额")
         super_net = latest.get("超大单净流入-净额")
 
@@ -777,19 +974,21 @@ def _fetch_money_flow_via_akshare(stock_code: str) -> Dict:
         super_net_flow = _parse_money_amount_to_yi(super_net)
 
         # 计算5日DDX近似值（5日主力净流入累计）
-        df["主力净额_num"] = pd.to_numeric(df["主力净流入-净额"], errors="coerce").fillna(0)
-        ddx_5_raw = df["主力净额_num"].rolling(5).sum().iloc[-1] if len(df) >= 5 else None
-        ddx_5 = float(round(ddx_5_raw / 100000000, 3)) if ddx_5_raw is not None else None
+        ordered["主力净额_num"] = pd.to_numeric(ordered["主力净流入-净额"], errors="coerce").fillna(0)
+        flow_5_raw = ordered["主力净额_num"].tail(5).sum() if len(ordered) >= 5 else None
+        flow_5 = float(round(flow_5_raw / 100000000, 3)) if flow_5_raw is not None else None
 
         # 计算10日DDY近似值（10日主力净流入累计）
-        ddy_10_raw = df["主力净额_num"].rolling(10).sum().iloc[-1] if len(df) >= 10 else None
-        ddy_10 = float(round(ddy_10_raw / 100000000, 3)) if ddy_10_raw is not None else None
+        flow_10_raw = ordered["主力净额_num"].tail(10).sum() if len(ordered) >= 10 else None
+        flow_10 = float(round(flow_10_raw / 100000000, 3)) if flow_10_raw is not None else None
 
         return {
             "main_net_flow": float(main_net_flow) if main_net_flow is not None else None,
             "super_net_flow": float(super_net_flow) if super_net_flow is not None else None,
-            "ddx_5": ddx_5,
-            "ddy_10": ddy_10,
+            "main_net_flow_5d": flow_5,
+            "main_net_flow_10d": flow_10,
+            "source": "akshare",
+            "as_of": _normalize_kline_date(latest.get(date_col), dashed=False) if date_col else "",
         }
     except Exception as e:
         logger.warning(f"akshare 资金流获取失败 {stock_code}: {e}")
@@ -879,13 +1078,15 @@ def _fetch_money_flow_via_eastmoney_direct(stock_code: str) -> Dict:
                 rows[-1],
             )
             main_series = [float(r["main_net_flow"]) for r in rows if r.get("main_net_flow") is not None]
-            ddx_5 = round(sum(main_series[-5:]), 3) if main_series else None
-            ddy_10 = round(sum(main_series[-10:]), 3) if main_series else None
+            flow_5 = round(sum(main_series[-5:]), 3) if main_series else None
+            flow_10 = round(sum(main_series[-10:]), 3) if main_series else None
             out = {
                 "main_net_flow": latest.get("main_net_flow"),
                 "super_net_flow": latest.get("super_net_flow"),
-                "ddx_5": ddx_5,
-                "ddy_10": ddy_10,
+                "main_net_flow_5d": flow_5,
+                "main_net_flow_10d": flow_10,
+                "source": "eastmoney",
+                "as_of": _normalize_kline_date(latest.get("date"), dashed=False),
             }
             with _EASTMONEY_LOCK:
                 _EASTMONEY_FAIL_STREAK = 0
@@ -929,9 +1130,12 @@ def _fetch_money_flow_via_akshare_rank(stock_code: str) -> Dict:
             if row.get("super_net_flow") is not None:
                 result["super_net_flow"] = row.get("super_net_flow")
         elif indicator == "5日" and row.get("main_net_flow") is not None:
-            result["ddx_5"] = row.get("main_net_flow")
+            result["main_net_flow_5d"] = row.get("main_net_flow")
         elif indicator == "10日" and row.get("main_net_flow") is not None:
-            result["ddy_10"] = row.get("main_net_flow")
+            result["main_net_flow_10d"] = row.get("main_net_flow")
+    if result:
+        result["source"] = "ak_rank"
+        result["as_of"] = ""
     return result
 
 
@@ -1007,7 +1211,38 @@ def _get_money_flow_rank_map(indicator: str) -> Dict:
 
 
 def _money_flow_coverage(money_flow: Dict) -> int:
-    return sum(1 for k in ("main_net_flow", "super_net_flow", "ddx_5", "ddy_10") if money_flow.get(k) is not None)
+    return sum(
+        1
+        for k in (
+            "main_net_flow",
+            "super_net_flow",
+            "ddx_5",
+            "ddy_10",
+            "main_net_flow_5d",
+            "main_net_flow_10d",
+        )
+        if money_flow.get(k) is not None
+    )
+
+
+def _sanitize_legacy_cached_money_flow(money_flow: Dict[str, Any]) -> Dict[str, Any]:
+    """Do not reuse legacy DDX/DDY values whose source semantics were not recorded."""
+    normalized = dict(money_flow or {})
+    source = str(normalized.get("source") or "").lower()
+    has_provenance = bool(normalized.get("field_sources")) and bool(normalized.get("units"))
+    ambiguous_source = not source or source in {"none", "cache", "cache_hot", "cache_stale"}
+    if has_provenance or not ambiguous_source:
+        return normalized
+    if normalized.get("ddx_5") is None and normalized.get("ddy_10") is None:
+        return normalized
+    normalized["ddx_5"] = None
+    normalized["ddy_10"] = None
+    normalized["legacy_semantics_ignored"] = True
+    flags = list(normalized.get("quality_flags") or [])
+    if "MONEY_FLOW_SEMANTICS_LEGACY" not in flags:
+        flags.append("MONEY_FLOW_SEMANTICS_LEGACY")
+    normalized["quality_flags"] = flags
+    return normalized
 
 
 def _get_cached_money_flow(stock_code: str, *, allow_partial: bool = True, allow_stale: bool = False) -> Dict:
@@ -1021,11 +1256,12 @@ def _get_cached_money_flow(stock_code: str, *, allow_partial: bool = True, allow
     debate_cache = _load_debate_data_cache()
     item = debate_cache.get(key, {}) if isinstance(debate_cache.get(key, {}), dict) else {}
     money_flow = item.get("money_flow", {}) if isinstance(item.get("money_flow", {}), dict) else {}
+    money_flow = _sanitize_legacy_cached_money_flow(money_flow)
     if not money_flow or not _money_flow_has_any_value(money_flow):
         return {}
     if str(item.get("updated", "") or "") != today:
         return {}
-    if not allow_partial and _money_flow_has_gap(money_flow):
+    if not allow_partial and _money_flow_is_partial(money_flow):
         return {}
     return money_flow
 
@@ -1051,38 +1287,99 @@ def _set_debate_cached_money_flow(stock_code: str, money_flow: Dict) -> None:
 
 def _merge_money_flow(*sources: Dict) -> Dict:
     """按字段合并资金流：前面的源优先，后面的源只补 None/缺失。"""
-    merged = {
-        "main_net_flow": None,
-        "super_net_flow": None,
-        "ddx_5": None,
-        "ddy_10": None,
-    }
+    fields = (
+        "main_net_flow",
+        "super_net_flow",
+        "ddx_5",
+        "ddy_10",
+        "main_net_flow_5d",
+        "main_net_flow_10d",
+    )
+    merged = {key: None for key in fields}
+    field_sources: Dict[str, str] = {}
+    field_as_of: Dict[str, str] = {}
     for source in sources:
         if not source:
             continue
-        for key in merged:
+        source_name = str(source.get("source") or "unknown")
+        source_as_of = str(source.get("as_of") or "")
+        source_field_sources = source.get("field_sources") or {}
+        source_field_as_of = source.get("field_as_of") or {}
+        for key in fields:
             value = source.get(key)
             if merged[key] is None and value is not None:
                 merged[key] = value
+                field_sources[key] = str(source_field_sources.get(key) or source_name)
+                field_as_of[key] = str(source_field_as_of.get(key) or source_as_of)
+    used_sources = _uniq_keep_order(list(field_sources.values()))
+    merged["source"] = "+".join(used_sources) if used_sources else "none"
+    merged["as_of"] = max((x for x in field_as_of.values() if x), default="")
+    merged["field_sources"] = field_sources
+    merged["field_as_of"] = field_as_of
+    merged["units"] = {
+        "main_net_flow": "CNY_100M",
+        "super_net_flow": "CNY_100M",
+        "ddx_5": "DDX_INDEX",
+        "ddy_10": "DDY_INDEX",
+        "main_net_flow_5d": "CNY_100M",
+        "main_net_flow_10d": "CNY_100M",
+    }
+    merged["aux_checked"] = any(bool(source.get("aux_checked")) for source in sources if source)
+    diagnostics: Dict[str, Any] = {}
+    for source in sources:
+        if isinstance(source, dict) and isinstance(source.get("diagnostics"), dict):
+            diagnostics.update(source["diagnostics"])
+    if diagnostics:
+        merged["diagnostics"] = diagnostics
     return merged
 
 
 def _empty_money_flow(source: str = "none") -> Dict:
-    return {
+    return _merge_money_flow({
         "main_net_flow": None,
         "super_net_flow": None,
         "ddx_5": None,
         "ddy_10": None,
+        "main_net_flow_5d": None,
+        "main_net_flow_10d": None,
         "source": source,
-    }
+    })
 
 
 def _money_flow_has_gap(money_flow: Dict) -> bool:
-    return any(money_flow.get(k) is None for k in ("main_net_flow", "super_net_flow", "ddx_5", "ddy_10"))
+    """Core execution-data gap; DDX/DDY are tracked separately as auxiliaries."""
+    return any(money_flow.get(k) is None for k in ("main_net_flow", "super_net_flow"))
+
+
+def _money_flow_aux_has_gap(money_flow: Dict) -> bool:
+    return any(money_flow.get(k) is None for k in ("ddx_5", "ddy_10"))
+
+
+def _money_flow_is_partial(money_flow: Dict) -> bool:
+    return _money_flow_has_gap(money_flow) or _money_flow_aux_has_gap(money_flow)
+
+
+def _money_flow_aux_flags(money_flow: Dict) -> List[str]:
+    flags: List[str] = []
+    if money_flow.get("ddx_5") is None:
+        flags.append("MONEY_FLOW_DDX_MISSING")
+    if money_flow.get("ddy_10") is None:
+        flags.append("MONEY_FLOW_DDY_MISSING")
+    return flags
 
 
 def _money_flow_has_any_value(money_flow: Dict) -> bool:
-    return any(money_flow.get(k) is not None for k in ("main_net_flow", "super_net_flow", "ddx_5", "ddy_10"))
+    return any(
+        money_flow.get(k) is not None
+        for k in (
+            "main_net_flow",
+            "super_net_flow",
+            "ddx_5",
+            "ddy_10",
+            "main_net_flow_5d",
+            "main_net_flow_10d",
+        )
+    )
 
 
 def _mx_money_flow_query_with_global_gate(tool, query: str):
@@ -1135,6 +1432,8 @@ def _pool_main_flow_to_yi(candidate: Dict[str, Any]) -> Optional[float]:
     if not isinstance(detail, dict):
         return None
     raw = detail.get("main_flow_value")
+    if raw is None and isinstance(detail.get("primary_detail"), dict):
+        raw = detail["primary_detail"].get("main_flow_value")
     if raw is None:
         return None
     try:
@@ -1247,8 +1546,12 @@ def _money_flow_cache_needs_refresh(item: Dict) -> bool:
         return True
     if money_flow.get("main_net_flow") is None:
         return True
-    # 主力净流入有值但其余字段缺失时也刷新一次，尽量补齐
-    return _money_flow_has_gap(money_flow)
+    if _money_flow_has_gap(money_flow):
+        return True
+    # Legacy same-day entries without an auxiliary fetch marker get one refresh.
+    # Once mx-data has explicitly checked DDX/DDY, a genuine provider omission is
+    # recorded as partial instead of refetching on every resume.
+    return _money_flow_aux_has_gap(money_flow) and not bool(money_flow.get("aux_checked"))
 
 
 def _cached_klines_valid(item: Dict, today: Optional[str] = None) -> bool:
@@ -1258,7 +1561,10 @@ def _cached_klines_valid(item: Dict, today: Optional[str] = None) -> bool:
     if str(item.get("updated", "") or "") != today:
         return False
     klines = item.get("klines", [])
-    return _kline_has_min_bars(klines)
+    if not _kline_has_min_bars(klines):
+        return False
+    latest = _normalize_kline_date((klines[-1] or {}).get("date"), dashed=False)
+    return latest == _previous_a_share_trading_day_compact()
 
 
 def _kline_has_min_bars(klines: Any, minimum: int = KLINE_EXTERNAL_FETCH_MIN_BARS) -> bool:
@@ -1282,7 +1588,12 @@ def _normalize_kline_date(value: Any, *, dashed: bool = True) -> str:
 
 def _is_a_share_trading_day_compact(compact: str) -> bool:
     try:
-        shared_dir = Path("~/.openclaw/agents/shared")
+        shared_dir = Path(
+            os.environ.get(
+                "OPENCLAW_SHARED_DIR",
+                Path.home() / ".openclaw" / "agents" / "shared",
+            )
+        )
         if shared_dir.exists() and str(shared_dir) not in sys.path:
             sys.path.insert(0, str(shared_dir))
         from trading_calendar import get_a_share_trading_day_status
@@ -1325,7 +1636,7 @@ def _xq_kline_manifest_trusted(expected_trading_day: str) -> bool:
 def _fetch_kline_via_http(stock_code: str, days: int = 60) -> Optional[List[Dict]]:
     """
     通过 QMT HTTP API (qmt_http_server.py) 获取日K线数据（主方案）
-    HTTP 服务运行在 Windows 机器上 (127.0.0.1:8080)，直接读取本地 xtquant 数据。
+    HTTP 服务地址由 QMT_HTTP_URL 配置，服务端读取本地 xtquant 数据。
     今日K线如果本地DAT缺失，用 /full_tick 实时接口补上。
     """
     try:
@@ -1335,7 +1646,7 @@ def _fetch_kline_via_http(stock_code: str, days: int = 60) -> Optional[List[Dict
         full_code = _ensure_suffix(stock_code)
 
         # Step 1: 获取历史K线（本地DAT缓存，可能缺今日数据）
-        url = f"{QMT_HTTP_URL}/market_data?stock={full_code}&period=1d&count={days}&fields=open,close,high,low,volume"
+        url = f"{QMT_HTTP_URL}/market_data?stock={full_code}&period=1d&count={days}&fields=open,close,high,low,volume,amount"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with _retry_call(f"QMT HTTP K线 {stock_code}", lambda: urllib.request.urlopen(req, timeout=15)) as resp:
             raw = resp.read().decode("utf-8")
@@ -1350,6 +1661,7 @@ def _fetch_kline_via_http(stock_code: str, days: int = 60) -> Optional[List[Dict
         high_data = data["data"].get("high", {})
         low_data = data["data"].get("low", {})
         volume_data = data["data"].get("volume", {})
+        amount_data = data["data"].get("amount", {})
 
         def get_v(field_dict, dt, stock=full_code):
             """从 {date: {stock: value}} 嵌套格式取值"""
@@ -1357,7 +1669,9 @@ def _fetch_kline_via_http(stock_code: str, days: int = 60) -> Optional[List[Dict
             v = inner.get(stock) if isinstance(inner, dict) else inner
             return v
 
-        all_dates = sorted(set().union(*[d.keys() for d in [close_data, open_data, high_data, low_data, volume_data] if d]))
+        all_dates = sorted(set().union(*[
+            d.keys() for d in [close_data, open_data, high_data, low_data, volume_data, amount_data] if d
+        ]))
         if not all_dates:
             return None
 
@@ -1368,6 +1682,7 @@ def _fetch_kline_via_http(stock_code: str, days: int = 60) -> Optional[List[Dict
             high = get_v(high_data, dt)
             low = get_v(low_data, dt)
             vol = get_v(volume_data, dt)
+            amount = get_v(amount_data, dt)
             if close is not None:
                 date_str = _normalize_kline_date(dt)
                 records.append({
@@ -1377,6 +1692,7 @@ def _fetch_kline_via_http(stock_code: str, days: int = 60) -> Optional[List[Dict
                     "high": float(high) if high else 0,
                     "low": float(low) if low else 0,
                     "volume": float(vol) if vol else 0,
+                    "amount": float(amount) if amount else 0,
                 })
 
         if not records:
@@ -1439,10 +1755,10 @@ def get_kline_via_xqshare(stock_code: str, days: int = 120) -> Optional[List[Dic
         from xqshare import XtQuantRemote
 
         client = XtQuantRemote(
-            host=os.getenv("XQSHARE_HOST", "127.0.0.1"),
-            port=int(os.getenv("XQSHARE_PORT", "18812")),
-            client_id=os.getenv("XQSHARE_CLIENT_ID", "client-standard"),
-            client_secret=os.getenv("XQSHARE_CLIENT_SECRET", ""),
+            host=os.environ.get("XQSHARE_HOST", "127.0.0.1"),
+            port=int(os.environ.get("XQSHARE_PORT", "18812")),
+            client_id=os.environ.get("XQSHARE_CLIENT_ID", "client-standard"),
+            client_secret=os.environ.get("XQSHARE_CLIENT_SECRET", ""),
             auto_reconnect=True,
         )
 
@@ -1472,6 +1788,7 @@ def get_kline_via_xqshare(stock_code: str, days: int = 120) -> Optional[List[Dic
                         "low": float(row.get("low", 0)),
                         "close": float(row.get("close", 0)),
                         "volume": float(row.get("volume", 0)),
+                        "amount": float(row.get("amount", 0) or 0),
                     })
                 return records[-days:]
         return None
@@ -1606,6 +1923,7 @@ def get_kline_via_akshare(stock_code: str, days: int = 120) -> Optional[List[Dic
                     "low": float(row["最低"]),
                     "close": float(row["收盘"]),
                     "volume": float(row["成交量"]),
+                    "amount": float(row.get("成交额", 0) or 0),
                 })
             return result
         return None
@@ -1613,6 +1931,105 @@ def get_kline_via_akshare(stock_code: str, days: int = 120) -> Optional[List[Dic
     except Exception as e:
         logger.warning(f"akshare K线获取失败 {stock_code}: {e}")
         return None
+
+
+def _fetch_best_kline(stock_code: str, days: int = 120) -> tuple[List[Dict[str, Any]], str]:
+    """Fetch one canonical K-line packet while retaining the best partial result."""
+    best: List[Dict[str, Any]] = []
+    best_source = "none"
+    expected_day = _previous_a_share_trading_day_compact()
+
+    def keep(source: str, candidate: Optional[List[Dict[str, Any]]]) -> bool:
+        nonlocal best, best_source
+        by_day: Dict[str, Dict[str, Any]] = {}
+        for row in candidate or []:
+            if not isinstance(row, dict) or not row.get("close"):
+                continue
+            day_key = _normalize_kline_date(row.get("date"), dashed=False)
+            if not day_key or day_key > expected_day:
+                continue
+            normalized = dict(row)
+            normalized["date"] = day_key
+            by_day[day_key] = normalized
+        clean = [by_day[day_key] for day_key in sorted(by_day)]
+        if len(clean) > len(best):
+            best = clean
+            best_source = source
+        latest = _normalize_kline_date((clean[-1] or {}).get("date"), dashed=False) if clean else ""
+        return _kline_has_min_bars(clean) and latest == expected_day
+
+    routes = (
+        ("xqshare", lambda: get_kline_via_xqshare(stock_code, days=days)),
+        ("qmt_http", lambda: _fetch_kline_via_http(stock_code, days=days)),
+        ("mx-data", lambda: get_kline_via_mx_data(stock_code, days=days)),
+        ("akshare", lambda: get_kline_via_akshare(stock_code, days=days)),
+        ("tencent", lambda: get_kline_via_tencent(stock_code, days=days)),
+    )
+    for source, fetcher in routes:
+        try:
+            if keep(source, fetcher()):
+                break
+        except Exception as exc:
+            logger.debug(f"K线筛选路由失败 {stock_code} {source}: {exc}")
+    return best[-days:], best_source
+
+
+def _extract_qmt_sector(value: Any) -> str:
+    """Pick a readable industry name from the varying xtdata.get_industry payloads."""
+    preferred: List[str] = []
+    fallback: List[str] = []
+
+    def walk(node: Any, key_hint: str = "") -> None:
+        if isinstance(node, dict):
+            for key, child in node.items():
+                walk(child, str(key))
+            return
+        if isinstance(node, (list, tuple, set)):
+            for child in node:
+                walk(child, key_hint)
+            return
+        text = str(node or "").strip()
+        if not text or text.lower() in {"none", "null", "nan"} or re.fullmatch(r"\d+", text):
+            return
+        if any(token in key_hint.lower() for token in ("industry", "name", "sector", "hy")):
+            preferred.append(text)
+        else:
+            fallback.append(text)
+
+    walk(value)
+    candidates = preferred + fallback
+    for item in candidates:
+        clean = _clean_xq_sector_name(item)
+        if clean and clean not in {"沪深A股", "A股", "股票"}:
+            return clean[:80]
+    return ""
+
+
+def _fetch_qmt_screening_metadata(stock_code: str) -> Dict[str, Any]:
+    full_code = _ensure_suffix(stock_code)
+    instrument_response = _qmt_get_json("/instrument_detail", {"stock": full_code}, timeout=6) or {}
+    instrument = instrument_response.get("data") if instrument_response.get("success") else {}
+    instrument = instrument if isinstance(instrument, dict) else {}
+    sector, sector_as_of = _get_fresh_cached_sector(stock_code, max_age_days=30)
+    sector_source = "sector_cache" if sector else ""
+    if not sector:
+        sector = _fetch_sector_via_xqshare(stock_code)
+        if sector:
+            sector_source = "xqshare_sector_map"
+            _set_cached_sector(stock_code, sector, source=sector_source, as_of=date.today().strftime("%Y%m%d"))
+            sector_as_of = date.today().strftime("%Y%m%d")
+    return {
+        "source": "qmt_http",
+        "checked_at": date.today().strftime("%Y%m%d"),
+        "instrument": instrument,
+        "listing_date": _normalize_kline_date(instrument.get("OpenDate"), dashed=False),
+        "expire_date": _normalize_kline_date(instrument.get("ExpireDate"), dashed=False),
+        "instrument_status": instrument.get("InstrumentStatus"),
+        "is_trading": instrument.get("IsTrading"),
+        "sector": sector,
+        "sector_source": sector_source or "none",
+        "sector_as_of": sector_as_of,
+    }
 
 
 def build_debate_packet(
@@ -1641,7 +2058,8 @@ def build_debate_packet(
     kline_source = "none"
     if cached_klines:
         kline_data = cached_klines
-        kline_source = "debate_data_cache"
+        cached_source = str((((cached_item.get("data_contract") or {}).get("kline") or {}).get("source") or ""))
+        kline_source = f"debate_data_cache:{cached_source}" if cached_source and "debate_data_cache" not in cached_source else "debate_data_cache"
         logger.info(f"  {stock_code} K线(缓存) {len(kline_data)} 条")
     elif _kline_has_min_bars(kline_data):
         # workflow 已通过 QMT HTTP 获取，直接用
@@ -1661,13 +2079,13 @@ def build_debate_packet(
                 best_source = source
             return _kline_has_min_bars(candidate)
 
-        if keep_candidate("qmt_http", _fetch_kline_via_http(stock_code, days=120)):
+        if keep_candidate("xqshare", get_kline_via_xqshare(stock_code, days=120)):
             pass
-        elif keep_candidate("xqshare", get_kline_via_xqshare(stock_code, days=120)):
-            pass
-        elif keep_candidate("akshare", get_kline_via_akshare(stock_code, days=120)):
+        elif keep_candidate("qmt_http", _fetch_kline_via_http(stock_code, days=120)):
             pass
         elif keep_candidate("mx-data", get_kline_via_mx_data(stock_code, days=120)):
+            pass
+        elif keep_candidate("akshare", get_kline_via_akshare(stock_code, days=120)):
             pass
         elif keep_candidate("tencent", get_kline_via_tencent(stock_code, days=120)):
             pass
@@ -1682,7 +2100,7 @@ def build_debate_packet(
     data_quality_flags = []
     if not kline_data:
         data_quality_flags.append("KLINE_MISSING")
-    elif len(kline_data) < 20:
+    elif len(kline_data) < KLINE_EXTERNAL_FETCH_MIN_BARS:
         data_quality_flags.append("KLINE_SHORT")
     else:
         try:
@@ -1695,59 +2113,82 @@ def build_debate_packet(
         except Exception as e:
             logger.debug(f"  {stock_code} K线缓存写入失败: {e}")
 
-    # 1. 优先从 xqshare 实时获取（本地 xtquant，不走网络下载）
-    xq_fin = _fetch_financial_via_xqshare(stock_code)
-    # 2. 从 phase1_cache 获取兜底
-    cache_fin = phase1_cache.get(stock_code, {}) if phase1_cache else {}
-    # 3. 合并：xqshare 有效字段优先，cache 补缺
-    fin = {}
-    for k, v in cache_fin.items():
-        fin[k] = v
+    # 财务数据默认严格缓存优先；仅缓存无有效指标或显式要求刷新时才联网补取。
+    cache_code = str(stock_code).strip().split(".", 1)[0].zfill(6)
+    cache_fin = normalize_financial_record(
+        (phase1_cache or {}).get(cache_code)
+        or (phase1_cache or {}).get(stock_code)
+        or {}
+    )
+    cache_fin_available = _financial_record_has_any_value(cache_fin)
+    live_refresh = _env_bool("FINANCIAL_LIVE_REFRESH_IN_PACKET", "0")
+    xq_fin = None
+    if live_refresh or not cache_fin_available:
+        xq_fin = normalize_financial_record(_fetch_financial_via_xqshare(stock_code))
+
+    # 在线刷新只覆盖非空字段，缓存继续为其余字段补缺。
+    fin = dict(cache_fin)
     if xq_fin:
         for k, v in xq_fin.items():
-            if v is not None:  # xqshare 有效值覆盖 cache
+            if v is not None and v != "":
                 fin[k] = v
-    # 如果 xqshare 全失败但 cache 有数据，记录一下
+
     financial_source = "none"
-    if xq_fin:
+    if xq_fin and cache_fin_available:
+        financial_source = "xqshare+phase1_cache"
+    elif xq_fin:
         financial_source = "xqshare"
-    elif cache_fin:
-        financial_source = "phase1_cache"
-    if not xq_fin and cache_fin:
+    elif cache_fin_available:
+        financial_source = str(fin.get("_source") or "phase1_cache")
+    if not xq_fin and cache_fin_available:
         logger.info(f"  {stock_code} 使用 phase1_cache 财务数据")
     elif xq_fin:
-        logger.info(f"  {stock_code} 使用 xqshare 实时财务数据")
-    if not xq_fin and not cache_fin:
+        logger.info(f"  {stock_code} 使用 xqshare 财务补取/刷新数据")
+    if not _financial_record_has_any_value(fin):
         data_quality_flags.append("FINANCIAL_MISSING")
+    financial_as_of = _normalize_kline_date(
+        fin.get("_as_of") or fin.get("report_date") or fin.get("end_date") or fin.get("m_timetag"),
+        dashed=False,
+    )
 
-    # 板块数据：优先财务缓存，其次本地持久缓存，再用 XQShare 反查成分股。
-    # akshare 板块兜底默认关闭，避免东财网络波动拖慢主流程。
+    # 板块数据：优先使用当天 XQShare 全市场映射；持久缓存仅在30天内有效。
+    # 旧缓存不能遮住新鲜映射，也不能在未核验时被重写成今天日期。
     sector_source = "none"
-    sector = fin.get("sector", "")
+    sector_as_of = ""
+    sector = _fetch_sector_via_xqshare(stock_code)
     if sector:
-        sector_source = financial_source
+        sector_source = "xqshare"
+        sector_as_of = date.today().strftime("%Y%m%d")
+        logger.info(f"  {stock_code} 板块(XQShare): {sector}")
     if not sector:
-        sector = _get_cached_sector(stock_code)
+        sector = fin.get("sector", "")
+        if sector:
+            sector_source = financial_source
+            sector_as_of = financial_as_of
+    if not sector:
+        sector, cached_sector_as_of = _get_fresh_cached_sector(stock_code)
         if sector:
             sector_source = "sector_cache"
-    if not sector:
-        sector = _fetch_sector_via_xqshare(stock_code)
-        if sector:
-            sector_source = "xqshare"
-            logger.info(f"  {stock_code} 板块(XQShare): {sector}")
+            sector_as_of = cached_sector_as_of
+        elif _get_cached_sector(stock_code):
+            logger.info(
+                f"  {stock_code} 忽略过期板块缓存 as_of={_get_cached_sector_as_of(stock_code)}"
+            )
     if not sector:
         sector = _fetch_sector_via_mx(stock_code)
         if sector:
             sector_source = "mx-data"
+            sector_as_of = date.today().strftime("%Y%m%d")
             logger.info(f"  {stock_code} 板块: {sector}")
     if not sector:
         sector = _fetch_sector_via_akshare(stock_code)
         if sector:
             sector_source = "akshare"
+            sector_as_of = date.today().strftime("%Y%m%d")
             logger.info(f"  {stock_code} 板块(akshare): {sector}")
-    if sector:
-        _set_cached_sector(stock_code, sector)
-    else:
+    if sector and sector_source != "sector_cache":
+        _set_cached_sector(stock_code, sector, source=sector_source, as_of=sector_as_of)
+    if not sector:
         data_quality_flags.append("SECTOR_MISSING")
 
     # 从K线计算技术摘要
@@ -1859,14 +2300,20 @@ def build_debate_packet(
         )
     if "money_flow_fetch_failed" not in locals():
         money_flow_fetch_failed = False
-    if all(money_flow.get(k) is None for k in ("main_net_flow", "super_net_flow", "ddx_5", "ddy_10")):
+    for flag in money_flow.get("quality_flags") or []:
+        if flag not in data_quality_flags:
+            data_quality_flags.append(flag)
+    if not _money_flow_has_any_value(money_flow):
         data_quality_flags.append("MONEY_FLOW_MISSING")
         if money_flow_fetch_failed:
             data_quality_flags.append("MONEY_FLOW_FETCH_FAILED")
     elif money_flow.get("main_net_flow") is None:
         data_quality_flags.append("MONEY_FLOW_MISSING")
-    elif any(money_flow.get(k) is None for k in ("super_net_flow", "ddx_5", "ddy_10")):
+    elif money_flow.get("super_net_flow") is None:
         data_quality_flags.append("MONEY_FLOW_PARTIAL")
+    for flag in _money_flow_aux_flags(money_flow):
+        if flag not in data_quality_flags:
+            data_quality_flags.append(flag)
     if live_money_flow_in_packet:
         _set_debate_cached_money_flow(stock_code, money_flow)
 
@@ -1877,12 +2324,17 @@ def build_debate_packet(
     # 新闻：优先读缓存，缓存无则 mx-search → akshare 串行获取
     cached = cache.get(stock_code, {})
     news_items = []
+    news_fetch_attempted = False
+    fetched_news_sources: List[str] = []
     if cached.get("news"):
         news_items = cached["news"]
         logger.info(f"  {stock_code} 新闻(缓存) {len(news_items)} 条")
     else:
+        news_fetch_attempted = True
         seen_titles = set()
         mx_news = _fetch_news_via_mxsearch(stock_name, max_results=5)
+        if os.environ.get("MX_APIKEY"):
+            fetched_news_sources.append("mx-search")
         for n in mx_news:
             title = n.get("title", "")
             if title and title not in seen_titles:
@@ -1891,6 +2343,7 @@ def build_debate_packet(
         logger.info(f"  {stock_code} mx-search 新闻 {len(mx_news)} 条（合并前）")
         try:
             import akshare as ak
+            fetched_news_sources.append("akshare")
             df = ak.stock_news_em(symbol=stock_code)
             if df is not None and len(df) > 0:
                 for _, row in df.iterrows():
@@ -1905,38 +2358,80 @@ def build_debate_packet(
         except Exception as e:
             logger.warning(f"  {stock_code} akshare 新闻获取失败: {e}")
 
+    cached_contract = cached.get("data_contract", {}) if isinstance(cached.get("data_contract", {}), dict) else {}
+    cached_news_contract = cached_contract.get("news", {}) if isinstance(cached_contract.get("news", {}), dict) else {}
+    news_content_as_of = max(
+        (_normalize_kline_date(x.get("time"), dashed=False) for x in news_items if isinstance(x, dict)),
+        default="",
+    )
+    news_checked_at = (
+        date.today().strftime("%Y%m%d")
+        if news_fetch_attempted
+        else str(cached_news_contract.get("checked_at") or cached.get("updated") or "")
+    )
+    news_source = (
+        ("+".join(_uniq_keep_order(fetched_news_sources)) or "none")
+        if news_fetch_attempted
+        else str(cached_news_contract.get("source") or "debate_data_cache")
+    )
+
     data_contract = {
         "kline": _data_result(
             source=kline_source,
-            status=_contract_status(bool(kline_data), bool(kline_data) and len(kline_data) < 60),
+            status=_contract_status(
+                bool(kline_data),
+                bool(kline_data) and len(kline_data) < KLINE_EXTERNAL_FETCH_MIN_BARS,
+            ),
             quality_flags=[f for f in data_quality_flags if f.startswith("KLINE_")],
+            as_of=_normalize_kline_date((kline_data[-1] or {}).get("date"), dashed=False) if kline_data else "",
         ),
         "money_flow": _data_result(
             source=str(money_flow.get("source") or "none"),
             status=_contract_status(
                 _money_flow_has_any_value(money_flow),
-                _money_flow_has_any_value(money_flow) and _money_flow_has_gap(money_flow),
+                _money_flow_has_any_value(money_flow) and _money_flow_is_partial(money_flow),
             ),
             error="fetch_failed" if money_flow_fetch_failed else "",
             quality_flags=[f for f in data_quality_flags if f.startswith("MONEY_FLOW_")],
+            as_of=str(money_flow.get("as_of") or ""),
         ),
         "financial": _data_result(
             source=financial_source,
-            status=_contract_status(bool(fin)),
+            status=_contract_status(_financial_record_has_any_value(fin)),
             quality_flags=[f for f in data_quality_flags if f == "FINANCIAL_MISSING"],
+            as_of=financial_as_of,
         ),
         "sector": _data_result(
             source=sector_source,
             status=_contract_status(bool(sector)),
             quality_flags=[f for f in data_quality_flags if f == "SECTOR_MISSING"],
+            as_of=sector_as_of,
         ),
         "news": _data_result(
-            source="debate_data_cache" if cached.get("news") else ("mx-search+akshare" if news_items else "none"),
+            source=news_source,
             status=_contract_status(bool(news_items)),
+            quality_flags=list(cached_news_contract.get("quality_flags") or []),
+            as_of=news_checked_at or news_content_as_of,
         ),
     }
+    data_contract["news"].update({
+        "checked_at": news_checked_at,
+        "content_as_of": news_content_as_of,
+    })
+    money_fields = (
+        "main_net_flow", "super_net_flow", "ddx_5", "ddy_10",
+        "main_net_flow_5d", "main_net_flow_10d",
+    )
+    data_contract["money_flow"]["field_status"] = {
+        field: ("ok" if money_flow.get(field) is not None else "missing")
+        for field in money_fields
+    }
+    data_contract["money_flow"]["field_sources"] = dict(money_flow.get("field_sources") or {})
+    data_contract["money_flow"]["field_as_of"] = dict(money_flow.get("field_as_of") or {})
+    data_contract["money_flow"]["units"] = dict(money_flow.get("units") or {})
+    data_contract["money_flow"]["diagnostics"] = dict(money_flow.get("diagnostics") or {})
 
-    return {
+    packet = {
         "stock_code": stock_code,
         "name": stock_name,
         "sector": sector,
@@ -1960,7 +2455,7 @@ def build_debate_packet(
             "book_value_per_share": fin.get("book_value_per_share"),
             # ★ 新增：回传真实数据来源 + 原始 fin 字典，供 callers 回写到 candidates
             "_fin_raw": dict(fin),
-            "_fin_source": "xqshare" if xq_fin else ("cache" if cache_fin else "none"),
+            "_fin_source": financial_source,
         },
         # 资金流数据
         "money_flow": {
@@ -1968,7 +2463,13 @@ def build_debate_packet(
             "super_net_flow": money_flow.get("super_net_flow"),   # 亿元
             "ddx_5": money_flow.get("ddx_5"),                    # 5日DDX（主力关注度）
             "ddy_10": money_flow.get("ddy_10"),                 # 10日DDY（趋势强度）
+            "main_net_flow_5d": money_flow.get("main_net_flow_5d"),
+            "main_net_flow_10d": money_flow.get("main_net_flow_10d"),
             "source": money_flow.get("source", "none"),         # 数据来源轨迹
+            "as_of": money_flow.get("as_of", ""),
+            "field_sources": money_flow.get("field_sources", {}),
+            "field_as_of": money_flow.get("field_as_of", {}),
+            "units": money_flow.get("units", {}),
         },
         # K线摘要
         "kline_summary": kline_summary,
@@ -1983,6 +2484,32 @@ def build_debate_packet(
         "elliott_wave": technical_signals.get("elliott_wave", {}),
         "gann_levels": technical_signals.get("gann_levels", {}),
     }
+    try:
+        from .data_router import attach_data_router_metadata
+    except Exception:
+        try:
+            from stock_selection_debate.data_router import attach_data_router_metadata
+        except Exception:
+            attach_data_router_metadata = None
+    if attach_data_router_metadata is not None:
+        try:
+            packet = attach_data_router_metadata(packet)
+        except Exception as exc:
+            logger.warning(f"  {stock_code} 数据路由合同归一化失败: {exc}")
+    try:
+        from .market_snapshot import attach_verified_market_snapshot
+    except Exception:
+        try:
+            from stock_selection_debate.market_snapshot import attach_verified_market_snapshot
+        except Exception:
+            attach_verified_market_snapshot = None
+    if attach_verified_market_snapshot is not None:
+        try:
+            packet = attach_verified_market_snapshot(packet)
+        except Exception as exc:
+            logger.warning(f"  {stock_code} 行情事实快照生成失败: {exc}")
+    return packet
+
 
 
 def summarize_kline(kline: List[Dict]) -> Dict:
@@ -2051,7 +2578,7 @@ def summarize_kline(kline: List[Dict]) -> Dict:
 
 
 def compute_indicators(kline: List[Dict]) -> Dict:
-    """计算简单技术指标：RSI(14)、MACD"""
+    """计算 RSI(14) 与统一口径 MACD。"""
     if not kline or len(kline) < 20:
         return {}
 
@@ -2066,20 +2593,18 @@ def compute_indicators(kline: List[Dict]) -> Dict:
     rs = avg_gain / avg_loss if avg_loss > 0 else 999
     rsi_14 = round(100 - 100 / (1 + rs), 1) if avg_loss > 0 else 100
 
-    # MACD (简单12/26 EMA)
-    ema12 = _ema(closes, 12)
-    ema26 = _ema(closes, 26)
-    macd = round(ema12 - ema26, 3)
-    signal = _ema([ema12 - ema26] * len(closes[-9:]), 9)
-    macd_hist = round(macd - signal, 3) if signal else 0
+    macd_result = compute_macd(closes)
 
     return {
         "rsi_14": rsi_14,
         "rsi_position": _rsi_position(kline, 20),   # RSI在近20日的位置(0-100)
-        "macd": macd,
-        "macd_signal": "金叉" if macd > signal else "死叉",
-        "macd_hist": macd_hist,
-        "macd_breadth": _macd_breadth(kline),           # MACD柱是否扩张
+        "macd": macd_result.get("dif"),
+        "macd_dea": macd_result.get("dea"),
+        "macd_signal": legacy_macd_signal(macd_result),
+        "macd_state": macd_result.get("state"),
+        "macd_cross_event": macd_result.get("cross_event"),
+        "macd_hist": macd_result.get("hist"),
+        "macd_breadth": macd_result.get("hist_slope"),
         "volume_momentum": _volume_momentum(kline),      # 量能变化方向
     }
 
@@ -2155,8 +2680,9 @@ def _parse_http_kline(data: dict) -> list:
     high_data = data.get("high", {})
     low_data = data.get("low", {})
     volume_data = data.get("volume", {})
+    amount_data = data.get("amount", {})
     all_dates = sorted(set().union(*[
-        d.keys() for d in [close_data, open_data, high_data, low_data, volume_data] if d
+        d.keys() for d in [close_data, open_data, high_data, low_data, volume_data, amount_data] if d
     ]))
     records = []
     for dt in all_dates:
@@ -2173,17 +2699,74 @@ def _parse_http_kline(data: dict) -> list:
             "low": _extract(low_data, dt),
             "close": _extract(close_data, dt),
             "volume": _extract(volume_data, dt),
+            "amount": _extract(amount_data, dt),
         })
     return records
 
 
-_DATA_CACHE_DIR = Path(__file__).parent / "output" / "data_cache"
+_DATA_CACHE_DIR = CACHE_DIR
+DEBATE_CACHE_SCHEMA_VERSION = "2026-07-10.field-provenance-v2"
 
 
 
 def _debate_data_cache_file():
     _DATA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     return _DATA_CACHE_DIR / "debate_data_cache.json"
+
+
+def _upgrade_legacy_debate_cache(data: Dict[str, Dict]) -> tuple[Dict[str, Dict], bool]:
+    changed = False
+    for item in data.values():
+        if not isinstance(item, dict) or item.get("cache_schema_version") == DEBATE_CACHE_SCHEMA_VERSION:
+            continue
+        klines = item.get("klines") if isinstance(item.get("klines"), list) else []
+        last_kline_day = _normalize_kline_date((klines[-1] or {}).get("date"), dashed=False) if klines else ""
+        old_flow = item.get("money_flow") if isinstance(item.get("money_flow"), dict) else {}
+        if _money_flow_has_any_value(old_flow) and not str(old_flow.get("source") or "").strip():
+            item["money_flow"] = _empty_money_flow("legacy_cache_invalidated")
+            item["money_flow"]["source"] = "legacy_cache_invalidated"
+        flow = item.get("money_flow") if isinstance(item.get("money_flow"), dict) else _empty_money_flow()
+        news = item.get("news") if isinstance(item.get("news"), list) else []
+        news_as_of = max(
+            (_normalize_kline_date(x.get("time"), dashed=False) for x in news if isinstance(x, dict)),
+            default="",
+        )
+        money_ok = _money_flow_has_any_value(flow)
+        item["data_contract"] = {
+            "money_flow": _data_result(
+                source=str(flow.get("source") or "none"),
+                status="partial" if money_ok else "missing",
+                error="legacy_cache_missing_provenance" if not money_ok else "",
+                quality_flags=[] if money_ok else ["MONEY_FLOW_PROVENANCE_UNKNOWN"],
+                as_of=str(flow.get("as_of") or ""),
+            ),
+            "kline": _data_result(
+                source="debate_data_cache:legacy",
+                status=_contract_status(bool(klines), bool(klines) and not _kline_has_min_bars(klines)),
+                quality_flags=[] if _kline_has_min_bars(klines) else (["KLINE_SHORT"] if klines else ["KLINE_MISSING"]),
+                as_of=last_kline_day,
+            ),
+            "news": _data_result(
+                source="debate_data_cache:legacy" if news else "none",
+                status=_contract_status(bool(news)),
+                as_of=news_as_of,
+            ),
+        }
+        item["data_contract"]["money_flow"].update({
+            "field_status": {
+                field: ("ok" if flow.get(field) is not None else "missing")
+                for field in (
+                    "main_net_flow", "super_net_flow", "ddx_5", "ddy_10",
+                    "main_net_flow_5d", "main_net_flow_10d",
+                )
+            },
+            "field_sources": dict(flow.get("field_sources") or {}),
+            "field_as_of": dict(flow.get("field_as_of") or {}),
+            "units": dict(flow.get("units") or {}),
+        })
+        item["cache_schema_version"] = DEBATE_CACHE_SCHEMA_VERSION
+        changed = True
+    return data, changed
 
 
 
@@ -2195,9 +2778,24 @@ def _load_debate_data_cache() -> Dict[str, Dict]:
     try:
         with open(f) as fp:
             data = json.load(fp)
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        data, changed = _upgrade_legacy_debate_cache(data)
+        if changed:
+            _save_json_cache(f, data)
+            logger.warning("已迁移旧辩论缓存：保留K线/新闻，失去来源的旧资金流已失效并等待重新预取")
+        return data
     except Exception:
         return {}
+
+
+def get_cached_debate_klines(stock_code: str) -> List[Dict[str, Any]]:
+    """Return today's canonical Phase1 K-line packet for downstream phases."""
+    key = str(stock_code).zfill(6)
+    item = _load_debate_data_cache().get(key, {})
+    if not _cached_klines_valid(item):
+        return []
+    return list(item.get("klines") or [])
 
 
 
@@ -2228,6 +2826,250 @@ def _merge_news(ak_news: List[Dict], mx_news: List[Dict]) -> List[Dict]:
             seen.add(t)
             merged.append(n)
     return merged
+
+
+_PREFETCH_CACHE_WRITE_LOCK = threading.Lock()
+
+
+def _persist_prefetch_partial(
+    stock_code: str,
+    *,
+    money_flow: Optional[Dict[str, Any]] = None,
+    news: Optional[List[Dict[str, Any]]] = None,
+    news_source: str = "",
+    klines: Optional[List[Dict[str, Any]]] = None,
+    kline_source: str = "",
+    screening_metadata: Optional[Dict[str, Any]] = None,
+    cache_override: Optional[Dict[str, Dict[str, Any]]] = None,
+    persist: bool = True,
+) -> None:
+    """Persist each completed prefetch result so an interruption loses no work."""
+    raw_key = str(stock_code or "").strip()
+    if not raw_key:
+        return
+    key = raw_key.zfill(6)
+    with _PREFETCH_CACHE_WRITE_LOCK:
+        current = cache_override if cache_override is not None else _load_debate_data_cache()
+        item = current.get(key, {}) if isinstance(current.get(key, {}), dict) else {}
+        today = date.today().strftime("%Y%m%d")
+        if item and str(item.get("updated") or "") != today:
+            # A screening-only refresh must never make yesterday's flow/news look current.
+            item = {}
+        contract = item.get("data_contract", {}) if isinstance(item.get("data_contract", {}), dict) else {}
+
+        if money_flow and _money_flow_has_any_value(money_flow):
+            old_flow = item.get("money_flow", {}) if isinstance(item.get("money_flow", {}), dict) else {}
+            merged_flow = _merge_money_flow(old_flow, money_flow)
+            item["money_flow"] = merged_flow
+            flow_flags = []
+            if merged_flow.get("main_net_flow") is None:
+                flow_flags.append("MONEY_FLOW_MISSING")
+            elif _money_flow_has_gap(merged_flow):
+                flow_flags.append("MONEY_FLOW_PARTIAL")
+            flow_flags.extend(_money_flow_aux_flags(merged_flow))
+            flow_contract = _data_result(
+                source=str(merged_flow.get("source") or "none"),
+                status=_contract_status(True, _money_flow_is_partial(merged_flow)),
+                quality_flags=flow_flags,
+                as_of=str(merged_flow.get("as_of") or ""),
+            )
+            flow_contract.update({
+                "field_status": {
+                    field: ("ok" if merged_flow.get(field) is not None else "missing")
+                    for field in (
+                        "main_net_flow", "super_net_flow", "ddx_5", "ddy_10",
+                        "main_net_flow_5d", "main_net_flow_10d",
+                    )
+                },
+                "field_sources": dict(merged_flow.get("field_sources") or {}),
+                "field_as_of": dict(merged_flow.get("field_as_of") or {}),
+                "units": dict(merged_flow.get("units") or {}),
+                "diagnostics": dict(merged_flow.get("diagnostics") or {}),
+            })
+            contract["money_flow"] = flow_contract
+
+        if news:
+            old_news = item.get("news", []) if isinstance(item.get("news", []), list) else []
+            merged_news = _merge_news(old_news, news)
+            item["news"] = merged_news
+            news_as_of = max(
+                (
+                    _normalize_kline_date(x.get("time"), dashed=False)
+                    for x in merged_news
+                    if isinstance(x, dict)
+                ),
+                default="",
+            )
+            old_news_contract = contract.get("news", {}) if isinstance(contract.get("news", {}), dict) else {}
+            source_parts = []
+            for source_text in (old_news_contract.get("source"), news_source):
+                for part in re.split(r"[+,]", str(source_text or "")):
+                    part = part.strip()
+                    if part and part not in {"none", "prefetch_incremental", "debate_data_cache"} and part not in source_parts:
+                        source_parts.append(part)
+            checked_at = date.today().strftime("%Y%m%d")
+            content_old = False
+            if news_as_of:
+                try:
+                    content_old = (date.today() - datetime.strptime(news_as_of, "%Y%m%d").date()).days > 7
+                except Exception:
+                    content_old = False
+            news_flags = ["NEWS_NO_RECENT_ITEMS"] if content_old else []
+            contract["news"] = _data_result(
+                source="+".join(source_parts) or "unknown",
+                status="checked_fresh_no_recent_items" if content_old else _contract_status(bool(merged_news)),
+                quality_flags=news_flags,
+                as_of=checked_at,
+            )
+            contract["news"].update({
+                "checked_at": checked_at,
+                "content_as_of": news_as_of,
+            })
+
+        if klines:
+            old_klines = item.get("klines", []) if isinstance(item.get("klines", []), list) else []
+            selected = klines if len(klines) >= len(old_klines) else old_klines
+            item["klines"] = selected
+            contract["kline"] = _data_result(
+                source=kline_source or "prefetch_incremental",
+                status=_contract_status(bool(selected), bool(selected) and not _kline_has_min_bars(selected)),
+                quality_flags=[] if _kline_has_min_bars(selected) else ["KLINE_SHORT"],
+                as_of=_normalize_kline_date((selected[-1] or {}).get("date"), dashed=False) if selected else "",
+            )
+
+        if screening_metadata:
+            old_meta = item.get("screening_metadata", {}) if isinstance(item.get("screening_metadata", {}), dict) else {}
+            merged_meta = dict(old_meta)
+            merged_meta.update(screening_metadata)
+            item["screening_metadata"] = merged_meta
+            instrument = merged_meta.get("instrument") if isinstance(merged_meta.get("instrument"), dict) else {}
+            contract["instrument"] = _data_result(
+                source=str(merged_meta.get("source") or "qmt_http"),
+                status="ok" if instrument else "missing",
+                quality_flags=[] if instrument else ["INSTRUMENT_METADATA_MISSING"],
+                as_of=str(merged_meta.get("checked_at") or today),
+            )
+            sector = str(merged_meta.get("sector") or "").strip()
+            contract["sector_screening"] = _data_result(
+                source=str(merged_meta.get("sector_source") or "none"),
+                status="ok" if sector else "missing",
+                quality_flags=[] if sector else ["SECTOR_SCREENING_MISSING"],
+                as_of=str(merged_meta.get("sector_as_of") or merged_meta.get("checked_at") or today),
+            )
+
+        item["data_contract"] = contract
+        item["updated"] = today
+        item["cache_schema_version"] = DEBATE_CACHE_SCHEMA_VERSION
+        item["prefetch_partial"] = True
+        current[key] = item
+        if persist:
+            _save_debate_data_cache(current)
+
+
+def prefetch_screening_data(
+    candidates: List[Dict[str, Any]],
+    benchmark_code: str = "000300.SH",
+) -> Dict[str, Any]:
+    """Lightweight pre-screen fetch that is reused by the later debate prefetch."""
+    today = date.today().strftime("%Y%m%d")
+    expected_day = _previous_a_share_trading_day_compact()
+    codes = _uniq_keep_order([
+        str(candidate.get("stock") or candidate.get("stock_code") or "").strip().zfill(6)
+        for candidate in candidates
+        if str(candidate.get("stock") or candidate.get("stock_code") or "").strip()
+    ])
+    cache = _load_debate_data_cache()
+    working_cache = dict(cache)
+    batch_size = _env_int("SCREENING_PREFETCH_BATCH", 3, minimum=1)
+    workers = _env_int("SCREENING_PREFETCH_WORKERS", 2, minimum=1)
+    pause = _env_float("SCREENING_PREFETCH_BATCH_PAUSE_SEC", 0.3, minimum=0.0)
+
+    def fetch_one(code: str) -> tuple[str, List[Dict[str, Any]], str, Dict[str, Any]]:
+        old = cache.get(code, {}) if isinstance(cache.get(code, {}), dict) else {}
+        if _cached_klines_valid(old, today):
+            klines = list(old.get("klines") or [])
+            source = str(((old.get("data_contract") or {}).get("kline") or {}).get("source") or "debate_data_cache")
+        else:
+            klines, source = _fetch_best_kline(code, days=120)
+        old_meta = old.get("screening_metadata", {}) if isinstance(old.get("screening_metadata", {}), dict) else {}
+        if str(old_meta.get("checked_at") or "") == today:
+            metadata = old_meta
+        else:
+            metadata = _fetch_qmt_screening_metadata(code)
+        return code, klines, source, metadata
+
+    total_batches = (len(codes) + batch_size - 1) // batch_size if codes else 0
+    for offset in range(0, len(codes), batch_size):
+        batch = codes[offset:offset + batch_size]
+        with ThreadPoolExecutor(max_workers=max(1, min(workers, len(batch)))) as executor:
+            futures = {executor.submit(fetch_one, code): code for code in batch}
+            for future in as_completed(futures):
+                code, klines, source, metadata = future.result()
+                _persist_prefetch_partial(
+                    code,
+                    klines=klines or None,
+                    kline_source=source,
+                    screening_metadata=metadata,
+                    cache_override=working_cache,
+                    persist=False,
+                )
+        with _PREFETCH_CACHE_WRITE_LOCK:
+            _save_debate_data_cache(working_cache)
+        done = offset // batch_size + 1
+        logger.info(f"筛选数据预取进度: 批 {done}/{total_batches} 完成")
+        if offset + batch_size < len(codes):
+            time.sleep(pause)
+
+    benchmark_file = _DATA_CACHE_DIR / f"screening_benchmark_{today}.json"
+    benchmark_payload: Dict[str, Any] = {}
+    try:
+        if benchmark_file.exists():
+            cached_benchmark = json.loads(benchmark_file.read_text(encoding="utf-8"))
+            cached_rows = cached_benchmark.get("klines") or []
+            cached_latest = _normalize_kline_date((cached_rows[-1] or {}).get("date"), dashed=False) if cached_rows else ""
+            if cached_benchmark.get("updated") == today and cached_latest == expected_day:
+                benchmark_payload = cached_benchmark
+    except Exception:
+        benchmark_payload = {}
+    if not benchmark_payload:
+        benchmark_rows, benchmark_source = _fetch_best_kline(benchmark_code, days=120)
+        benchmark_payload = {
+            "schema_version": "screening-benchmark-v1",
+            "updated": today,
+            "as_of": _normalize_kline_date((benchmark_rows[-1] or {}).get("date"), dashed=False) if benchmark_rows else "",
+            "benchmark": benchmark_code,
+            "source": benchmark_source,
+            "klines": benchmark_rows,
+        }
+        _save_json_cache(benchmark_file, benchmark_payload)
+
+    current = _load_debate_data_cache()
+    stock_payload = {}
+    fresh_count = 0
+    for code in codes:
+        item = current.get(code, {}) if isinstance(current.get(code, {}), dict) else {}
+        rows = list(item.get("klines") or [])
+        latest = _normalize_kline_date((rows[-1] or {}).get("date"), dashed=False) if rows else ""
+        if _kline_has_min_bars(rows) and latest == expected_day:
+            fresh_count += 1
+        stock_payload[code] = {
+            "klines": rows,
+            "screening_metadata": dict(item.get("screening_metadata") or {}),
+            "data_contract": dict(item.get("data_contract") or {}),
+            "updated": item.get("updated"),
+        }
+    return {
+        "schema_version": "screening-prefetch-v1",
+        "updated": today,
+        "as_of": expected_day,
+        "stocks": stock_payload,
+        "benchmark": benchmark_payload,
+        "stats": {
+            "requested": len(codes),
+            "fresh_kline": fresh_count,
+            "coverage": round(fresh_count / len(codes), 4) if codes else 0.0,
+        },
+    }
 
 
 def _prefetch_debate_data(candidates: List[Dict]) -> None:
@@ -2294,6 +3136,7 @@ def _prefetch_debate_data(candidates: List[Dict]) -> None:
         workers: int = 3,
         batch_size: Optional[int] = None,
         batch_pause: Optional[float] = None,
+        on_result=None,
     ) -> Dict[str, Dict]:
         results: Dict[str, Dict] = {}
         if not items or _money_flow_budget_left() <= 0:
@@ -2314,6 +3157,11 @@ def _prefetch_debate_data(candidates: List[Dict]) -> None:
                     sc, mf = f.result()
                     if mf:
                         results[sc] = mf
+                        if on_result is not None:
+                            try:
+                                on_result(sc, mf)
+                            except Exception as exc:
+                                logger.warning(f"{label} 增量缓存失败 {sc}: {exc}")
             except TimeoutError:
                 logger.warning(f"{label} 预获取超时，已返回已完成结果并放弃本批未完成任务")
             finally:
@@ -2350,6 +3198,7 @@ def _prefetch_debate_data(candidates: List[Dict]) -> None:
             workers=1,
             batch_size=_env_int("MX_MONEY_FLOW_PREFETCH_BATCH", 1, minimum=1),
             batch_pause=_env_float("MX_MONEY_FLOW_PREFETCH_BATCH_PAUSE_SEC", 3.0, minimum=0.0),
+            on_result=lambda sc, mf: _persist_prefetch_partial(sc, money_flow=mf),
         )
 
     # ── Eastmoney 直连补齐：mx-data 缺字段/触发112后默认接力补齐，降低 mx 压力 ──
@@ -2376,6 +3225,7 @@ def _prefetch_debate_data(candidates: List[Dict]) -> None:
             workers=_env_int("EASTMONEY_FLOW_PREFETCH_WORKERS", 1, minimum=1),
             batch_size=_env_int("EASTMONEY_FLOW_PREFETCH_BATCH", 1, minimum=1),
             batch_pause=_env_float("EASTMONEY_FLOW_PREFETCH_BATCH_PAUSE_SEC", 0.6, minimum=0.0),
+            on_result=lambda sc, mf: _persist_prefetch_partial(sc, money_flow=mf),
         )
 
     ak_mf_results = {}
@@ -2394,7 +3244,12 @@ def _prefetch_debate_data(candidates: List[Dict]) -> None:
             return sc, {}
 
     if ak_stocks and _env_bool("ENABLE_AKSHARE_INDIVIDUAL_FLOW_PREFETCH", "0"):
-        ak_mf_results = _run_parallel_money_source("akshare 个股资金流", ak_stocks, _akshare_money_flow)
+        ak_mf_results = _run_parallel_money_source(
+            "akshare 个股资金流",
+            ak_stocks,
+            _akshare_money_flow,
+            on_result=lambda sc, mf: _persist_prefetch_partial(sc, money_flow=mf),
+        )
 
     # ── akshare 新闻小批量并行（3线程+间隔1s）──
     def _akshare_news(sc: str):
@@ -2426,6 +3281,7 @@ def _prefetch_debate_data(candidates: List[Dict]) -> None:
                 sc, news = f.result()
                 if news:
                     ak_news_results[sc] = news
+                    _persist_prefetch_partial(sc, news=news, news_source="akshare")
         if i + BATCH < len(news_stocks_to_fetch):
             time.sleep(1)
 
@@ -2445,6 +3301,7 @@ def _prefetch_debate_data(candidates: List[Dict]) -> None:
                 sc, news = f.result()
                 if news:
                     mx_news_results[sc] = news
+                    _persist_prefetch_partial(sc, news=news, news_source="mx-search")
         done_batches = i // BATCH + 1
         logger.info(f"mx-search 新闻进度: 批 {done_batches}/{mx_news_total_batches} 完成，已获取 {len(mx_news_results)}/{len(news_stocks_to_fetch)} 只")
         if i + BATCH < len(news_stocks_to_fetch):
@@ -2452,29 +3309,11 @@ def _prefetch_debate_data(candidates: List[Dict]) -> None:
 
     # ── 完整日K线预获取：写入同一个 debate_data_cache，后续 build_debate_packet 直接读缓存 ──
     kline_results: Dict[str, List[Dict[str, Any]]] = {}
+    kline_sources: Dict[str, str] = {}
 
     def _prefetch_one_kline(sc: str):
-        best_kline: List[Dict[str, Any]] = []
-
-        def keep(candidate: Optional[List[Dict[str, Any]]]) -> bool:
-            nonlocal best_kline
-            if not candidate:
-                return False
-            if len(candidate) > len(best_kline):
-                best_kline = candidate
-            return _kline_has_min_bars(candidate)
-
-        if keep(_fetch_kline_via_http(sc, days=120)):
-            pass
-        elif keep(get_kline_via_xqshare(sc, days=120)):
-            pass
-        elif keep(get_kline_via_akshare(sc, days=120)):
-            pass
-        elif keep(get_kline_via_mx_data(sc, days=120)):
-            pass
-        elif keep(get_kline_via_tencent(sc, days=120)):
-            pass
-        return sc, (best_kline[-120:] if best_kline else [])
+        best_kline, selected_source = _fetch_best_kline(sc, days=120)
+        return sc, best_kline, selected_source
 
     kline_batch = _env_int("KLINE_PREFETCH_BATCH", 3, minimum=1)
     kline_workers = _env_int("KLINE_PREFETCH_WORKERS", 2, minimum=1)
@@ -2490,9 +3329,11 @@ def _prefetch_debate_data(candidates: List[Dict]) -> None:
         with ThreadPoolExecutor(max_workers=max(1, min(kline_workers, len(batch)))) as ex:
             futures = {ex.submit(_prefetch_one_kline, s): s for s in batch}
             for f in as_completed(futures):
-                sc, klines = f.result()
+                sc, klines, source = f.result()
                 if klines:
                     kline_results[sc] = klines
+                    kline_sources[sc] = source
+                    _persist_prefetch_partial(sc, klines=klines, kline_source=source)
         done_batches = i // kline_batch + 1
         logger.info(
             f"K线预获取进度: 批 {done_batches}/{kline_total_batches} 完成，"
@@ -2519,11 +3360,12 @@ def _prefetch_debate_data(candidates: List[Dict]) -> None:
             if merged_mf.get("main_net_flow") is None:
                 seeded = _pool_main_flow_to_yi(candidate_map.get(str(sc).zfill(6), {}))
                 if seeded is not None:
-                    merged_mf["main_net_flow"] = seeded
-                    src = str(merged_mf.get("source") or "")
-                    merged_mf["source"] = "pool_seed" if not src else f"{src}+pool_seed"
+                    merged_mf = _merge_money_flow(
+                        merged_mf,
+                        {"main_net_flow": seeded, "source": "pool_seed", "as_of": ""},
+                    )
             final_mf = merged_mf if merged_mf else old_mf
-            if _money_flow_has_gap(final_mf):
+            if _money_flow_is_partial(final_mf):
                 missing_fields = [
                     k for k in ("main_net_flow", "super_net_flow", "ddx_5", "ddy_10")
                     if final_mf.get(k) is None
@@ -2552,38 +3394,104 @@ def _prefetch_debate_data(candidates: List[Dict]) -> None:
             mf_flags.append("MONEY_FLOW_MISSING")
         elif _money_flow_has_gap(final_mf):
             mf_flags.append("MONEY_FLOW_PARTIAL")
-        kline_flags = [] if kline_results.get(sc) or old.get("klines") else ["KLINE_MISSING"]
+        mf_flags.extend(_money_flow_aux_flags(final_mf or {}))
+        selected_klines = kline_results.get(sc) or old.get("klines") or []
+        if not selected_klines:
+            kline_flags = ["KLINE_MISSING"]
+        elif not _kline_has_min_bars(selected_klines):
+            kline_flags = ["KLINE_SHORT"]
+        else:
+            kline_flags = []
+        final_news = news_new if news_new else old.get("news", [])
+        news_content_as_of = max(
+            (
+                _normalize_kline_date(x.get("time"), dashed=False)
+                for x in (final_news or [])
+                if isinstance(x, dict)
+            ),
+            default="",
+        )
+        news_checked_at = today if sc in news_stocks_to_fetch else str(
+            ((old.get("data_contract") or {}).get("news") or {}).get("checked_at")
+            or old.get("updated")
+            or ""
+        )
+        news_content_old = False
+        if news_content_as_of:
+            try:
+                news_content_old = (date.today() - datetime.strptime(news_content_as_of, "%Y%m%d").date()).days > 7
+            except Exception:
+                news_content_old = False
+        news_flags = ["NEWS_NO_RECENT_ITEMS"] if sc in news_stocks_to_fetch and (not final_news or news_content_old) else []
+        news_status = (
+            "checked_fresh_no_recent_items"
+            if sc in news_stocks_to_fetch and (not final_news or news_content_old)
+            else _contract_status(bool(final_news))
+        )
+        old_contract = old.get("data_contract", {}) if isinstance(old.get("data_contract", {}), dict) else {}
         cache_item = {
             "money_flow": final_mf,
-            "news": news_new if news_new else old.get("news", []),
+            "news": final_news,
             "klines": kline_results.get(sc) or old.get("klines", []),
+            "screening_metadata": dict(old.get("screening_metadata") or {}),
             "data_contract": {
                 "money_flow": _data_result(
                     source=str((final_mf or {}).get("source") or "none"),
                     status=_contract_status(
                         bool(final_mf and _money_flow_has_any_value(final_mf)),
-                        bool(final_mf and _money_flow_has_any_value(final_mf) and _money_flow_has_gap(final_mf)),
+                        bool(final_mf and _money_flow_has_any_value(final_mf) and _money_flow_is_partial(final_mf)),
                     ),
                     quality_flags=mf_flags,
+                    as_of=str((final_mf or {}).get("as_of") or ""),
                 ),
                 "kline": _data_result(
-                    source="prefetch_chain" if kline_results.get(sc) else ("debate_data_cache" if old.get("klines") else "none"),
-                    status=_contract_status(bool(kline_results.get(sc) or old.get("klines"))),
+                    source=kline_sources.get(sc) or ("debate_data_cache" if old.get("klines") else "none"),
+                    status=_contract_status(bool(selected_klines), bool(selected_klines) and not _kline_has_min_bars(selected_klines)),
                     quality_flags=kline_flags,
+                    as_of=_normalize_kline_date((selected_klines[-1] or {}).get("date"), dashed=False) if selected_klines else "",
                 ),
                 "news": _data_result(
-                    source="akshare+mx-search" if news_new else ("debate_data_cache" if old.get("news") else "none"),
-                    status=_contract_status(bool(news_new or old.get("news"))),
+                    source=(
+                        "akshare+mx-search"
+                        if sc in news_stocks_to_fetch
+                        else str(((old.get("data_contract") or {}).get("news") or {}).get("source") or "debate_data_cache")
+                    ),
+                    status=news_status,
+                    quality_flags=news_flags,
+                    as_of=news_checked_at or news_content_as_of,
                 ),
+                "instrument": dict(old_contract.get("instrument") or {}),
+                "sector_screening": dict(old_contract.get("sector_screening") or {}),
             },
             "updated": date.today().strftime("%Y%m%d"),
+            "cache_schema_version": DEBATE_CACHE_SCHEMA_VERSION,
         }
+        cache_item["data_contract"]["money_flow"].update({
+            "field_status": {
+                field: ("ok" if (final_mf or {}).get(field) is not None else "missing")
+                for field in (
+                    "main_net_flow", "super_net_flow", "ddx_5", "ddy_10",
+                    "main_net_flow_5d", "main_net_flow_10d",
+                )
+            },
+            "field_sources": dict((final_mf or {}).get("field_sources") or {}),
+            "field_as_of": dict((final_mf or {}).get("field_as_of") or {}),
+            "units": dict((final_mf or {}).get("units") or {}),
+            "diagnostics": dict((final_mf or {}).get("diagnostics") or {}),
+        })
+        cache_item["data_contract"]["news"].update({
+            "checked_at": news_checked_at,
+            "content_as_of": news_content_as_of,
+        })
         cache[sc] = cache_item
         raw_sc = raw_key_by_stock.get(sc)
         if raw_sc and raw_sc != sc:
             cache[raw_sc] = cache_item
     _save_debate_data_cache(cache)
     complete = 0
+    aux_complete = 0
+    ddx_missing = 0
+    ddy_missing = 0
     missing_main = 0
     all_missing = 0
     seeded_main = 0
@@ -2601,6 +3509,12 @@ def _prefetch_debate_data(candidates: List[Dict]) -> None:
             continue
         if not _money_flow_has_gap(mf):
             complete += 1
+        if not _money_flow_aux_has_gap(mf):
+            aux_complete += 1
+        if mf.get("ddx_5") is None:
+            ddx_missing += 1
+        if mf.get("ddy_10") is None:
+            ddy_missing += 1
     kline_complete = 0
     for sc in stocks:
         item = cache.get(sc, {}) if isinstance(cache.get(sc, {}), dict) else {}
@@ -2610,7 +3524,9 @@ def _prefetch_debate_data(candidates: List[Dict]) -> None:
                f"(qmt_mf={len(qmt_mf_results)} ak_mf={len(ak_mf_results)} mx_mf={len(mx_mf_results)} em_mf={len(em_mf_results)} "
                f"ak_news={len(ak_news_results)} mx_news={len(mx_news_results)} "
                f"kline_complete={kline_complete}/{len(stocks)} "
-               f"money_flow_complete={complete}/{len(money_stocks_to_fetch)} "
+               f"money_flow_core_complete={complete}/{len(money_stocks_to_fetch)} "
+               f"money_flow_aux_complete={aux_complete}/{len(money_stocks_to_fetch)} "
+               f"ddx_missing={ddx_missing} ddy_missing={ddy_missing} "
                f"money_flow_main_missing={missing_main} all_missing={all_missing} "
                f"money_flow_seeded_main={seeded_main})")
 
@@ -2629,7 +3545,15 @@ def load_phase1_cache(output_dir: Path) -> Dict:
         with open(cache_file) as f:
             data = json.load(f)
         records = data.get("data", data) if isinstance(data, dict) else {}
-        return records
+        if not isinstance(records, dict):
+            return {}
+        normalized = {}
+        for raw_code, record in records.items():
+            if not isinstance(record, dict):
+                continue
+            code = str(raw_code).strip().split(".", 1)[0].zfill(6)
+            normalized[code] = normalize_financial_record(record)
+        return normalized
     except Exception as e:
         logger.warning(f"读取 Phase1 缓存失败: {e}")
         return {}

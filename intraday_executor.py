@@ -3,6 +3,7 @@ import os
 import sys
 import logging
 import argparse
+import gzip
 import json
 import re
 import requests
@@ -13,6 +14,7 @@ import urllib.request
 from pathlib import Path
 from datetime import date, datetime, time as dt_time, timedelta
 from typing import Any, Dict, List, Literal, Optional
+from workflow_common import coerce_bool, setup_file_logging
 
 try:
     from pydantic import BaseModel, Field
@@ -48,7 +50,8 @@ def _get_xq_client():
         sys.path.insert(0, str(BASE_DIR.parent / "knowledge-base" / "xqshare"))
         from client import XtQuantRemote
         host = os.environ.get("XQSHARE_REMOTE_HOST", "127.0.0.1")
-        _XQ_CLIENT = XtQuantRemote(host=host, port=18812, log_level="WARNING")
+        port = int(os.environ.get("XQSHARE_PORT", "18812"))
+        _XQ_CLIENT = XtQuantRemote(host=host, port=port, log_level="WARNING")
         if hasattr(_XQ_CLIENT, "connect"):
             _XQ_CLIENT.connect()
         return _XQ_CLIENT
@@ -62,21 +65,28 @@ def _get_xq_client():
 BASE_DIR = Path(__file__).parent
 OUTPUT_DIR = BASE_DIR / "output"
 LOG_DIR = BASE_DIR / "logs"
-LOG_DIR.mkdir(exist_ok=True)
+
+_BUY_TIMING_MARKET_BUFFER: Dict[str, Any] = {}
+_BUY_TIMING_MARKET_LAST_FLUSH = 0.0
 
 from trade_position_sync import load_local_env, reconcile_trades_file_with_account, reconcile_trades_with_positions
 
 load_local_env()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_DIR / f"intraday_{date.today().strftime('%Y%m%d')}.log"),
-        logging.StreamHandler()
-    ]
-)
 logger = logging.getLogger("intraday_executor")
+_LOGGING_READY = False
+
+
+def setup_logging() -> logging.Logger:
+    global logger, _LOGGING_READY
+    if not _LOGGING_READY:
+        logger = setup_file_logging(
+            logger_name="intraday_executor",
+            log_dir=LOG_DIR,
+            filename_prefix="intraday",
+        )
+        _LOGGING_READY = True
+    return logger
 
 # ── mx-moni / 任务配置 ───────────────────────────────────
 API_URL = os.getenv("MX_API_URL", "https://mkapi2.dfcfs.com/finskillshub")
@@ -168,7 +178,7 @@ def _calc_trailing_stop_pct(
     return STOP_LOSS_PCT
 
 INTRADAY_LLM_MODEL = os.getenv("INTRADAY_LLM_MODEL", "minimax-portal/MiniMax-M3")
-INTRADAY_LLM_FALLBACK_MODEL = os.getenv("INTRADAY_LLM_FALLBACK_MODEL", "openai-codex/gpt-5.5")
+INTRADAY_LLM_FALLBACK_MODEL = os.getenv("INTRADAY_LLM_FALLBACK_MODEL", "openai/gpt-5.6-sol")
 INTRADAY_BUY_TIMING_LLM_MODEL = os.getenv("INTRADAY_BUY_TIMING_LLM_MODEL", INTRADAY_LLM_MODEL)
 INTRADAY_BUY_TIMING_LLM_FALLBACK_MODEL = os.getenv("INTRADAY_BUY_TIMING_LLM_FALLBACK_MODEL", INTRADAY_LLM_FALLBACK_MODEL)
 
@@ -468,6 +478,18 @@ def _as_float(value, default=None):
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _as_price(value, default=None):
+    """价格字段读取：A 股最小变动 0.01 元，自动 round 到 2 位消除 IEEE 754 精度尾巴。
+
+    只用于 close/open/high/low/prev_close/limit_up/limit_down 等价格字段，
+    不要用于 volume/amount/change_pct/score/timestamp 等非价格数值。
+    """
+    f = _as_float(value, default)
+    if f is None:
+        return None
+    return round(f, 2)
 
 
 def _level1_value(value):
@@ -885,11 +907,11 @@ def _normalize_realtime_quote(stock_code: str, raw: Dict, source: str = "") -> O
     """Normalize XQShare/Tencent-like quote dictionaries into executor quote shape."""
     if not isinstance(raw, dict):
         return None
-    price = _as_float(_first_present(raw, "lastPrice", "last_price", "latestPrice", "price", "close"))
+    price = _as_price(_first_present(raw, "lastPrice", "last_price", "latestPrice", "price", "close"))
     if not price or price <= 0:
         return None
 
-    prev_close = _as_float(_first_present(raw, "lastClose", "preClose", "prevClose", "pre_close", "y_close"))
+    prev_close = _as_price(_first_present(raw, "lastClose", "preClose", "prevClose", "pre_close", "y_close"))
     change_pct = _as_float(_first_present(raw, "changePct", "pctChg", "change_pct", "pct_change"))
     if prev_close and prev_close > 0:
         change_pct = round((price - prev_close) / prev_close * 100, 2)
@@ -900,8 +922,8 @@ def _normalize_realtime_quote(stock_code: str, raw: Dict, source: str = "") -> O
 
     name = str(_first_present(raw, "name", "secName", default="") or "")
     limit_pct = _stock_limit_pct(stock_code, name)
-    limit_up = _as_float(_first_present(raw, "upperLimit", "limitUp", "limit_up"))
-    limit_down = _as_float(_first_present(raw, "lowerLimit", "limitDown", "limit_down"))
+    limit_up = _as_price(_first_present(raw, "upperLimit", "limitUp", "limit_up"))
+    limit_down = _as_price(_first_present(raw, "lowerLimit", "limitDown", "limit_down"))
     if prev_close and prev_close > 0:
         limit_up = limit_up or round(prev_close * (1 + limit_pct), 2)
         limit_down = limit_down or round(prev_close * (1 - limit_pct), 2)
@@ -910,9 +932,9 @@ def _normalize_realtime_quote(stock_code: str, raw: Dict, source: str = "") -> O
     if not limit_down:
         limit_down = round(price * (1 - limit_pct), 2)
 
-    open_price = _as_float(_first_present(raw, "open", "openPrice"))
-    high = _as_float(_first_present(raw, "high", "highPrice"))
-    low = _as_float(_first_present(raw, "low", "lowPrice"))
+    open_price = _as_price(_first_present(raw, "open", "openPrice"))
+    high = _as_price(_first_present(raw, "high", "highPrice"))
+    low = _as_price(_first_present(raw, "low", "lowPrice"))
     volume = _as_float(_first_present(raw, "volume", "vol"), 0.0)
     amount = _as_float(_first_present(raw, "amount", "turnover"), 0.0)
     bid1 = _level1_value(_first_present(raw, "bidPrice", "bid_price", "bid1"))
@@ -1078,7 +1100,7 @@ def get_realtime_quote(stock_code: str, retries: int = 3) -> Optional[Dict]:
         try:
             import urllib.request
             full_code = _ensure_suffix(code)
-            url = f"http://127.0.0.1:8080/realtime_quote?stock={full_code}"
+            url = f"{XQ_HTTP_BASE}/realtime_quote?stock={full_code}"
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=10) as r:
                 data = json.loads(r.read().decode("utf-8"))
@@ -1466,6 +1488,17 @@ def _normalize_buy_signal(signal: Dict) -> Dict:
     normalized["confidence"] = _confidence_value(normalized)
     if normalized.get("buy_score") in (None, ""):
         normalized["buy_score"] = _buy_score_value(normalized)
+    gate = normalized.get("execution_gate")
+    if not gate:
+        gate = "DIRECT_BUY_ALLOWED" if action == "BUY" else "INTRADAY_CONFIRMATION_REQUIRED" if action == "WATCH" else "NO_BUY"
+    normalized["execution_gate"] = gate
+    normalized["intraday_execution_gate"] = gate
+    normalized["intraday_entry_condition"] = normalized.get("entry_condition") or (
+        "开盘强势或盘中强势可买" if gate == "DIRECT_BUY_ALLOWED" else "盘中放量突破或回踩承接确认"
+    )
+    normalized["intraday_block_buy_reason"] = normalized.get("block_buy_reason") or ";".join(str(x) for x in (normalized.get("signal_blockers") or [])[:2])
+    normalized["allow_direct_buy"] = coerce_bool(normalized.get("allow_direct_buy"), gate == "DIRECT_BUY_ALLOWED")
+    normalized["needs_intraday_confirmation"] = coerce_bool(normalized.get("needs_intraday_confirmation"), gate != "DIRECT_BUY_ALLOWED")
     return normalized
 
 
@@ -1688,6 +1721,7 @@ def _load_ready_daily_report(report_file: Path, wait_seconds: int = None, poll_s
 
 
 def run_buy_mode():
+    setup_logging()
     """
     盘中买入模式(每天 09:35 触发,cron: intraday-buy)
     1. 交易日检查
@@ -2102,6 +2136,179 @@ def _buy_timing_pid_file() -> Path:
     return OUTPUT_DIR / "buy_timing.pid"
 
 
+def _buy_timing_event_file(day: date = None) -> Path:
+    day = day or date.today()
+    return OUTPUT_DIR / f"intraday_buy_events_{day.strftime('%Y%m%d')}.jsonl"
+
+
+def _buy_timing_market_file(day: date = None) -> Path:
+    day = day or date.today()
+    return OUTPUT_DIR / f"intraday_buy_market_{day.strftime('%Y%m%d')}.json.gz"
+
+
+def _compact_audit_market(quote: Dict = None, technical_snapshot: Dict = None) -> Dict:
+    quote = quote or {}
+    snapshot = technical_snapshot or {}
+    result = {
+        "price": _as_price(quote.get("price") or snapshot.get("latest")),
+        "open": _as_price(quote.get("open") or snapshot.get("day_open")),
+        "high": _as_price(quote.get("high") or snapshot.get("high")),
+        "low": _as_price(quote.get("low") or snapshot.get("low")),
+        "prev_close": _as_price(quote.get("prev_close")),
+        "limit_up": _as_price(quote.get("limit_up")),
+        "limit_down": _as_price(quote.get("limit_down")),
+        "bid1": _as_price(quote.get("bid1")),
+        "ask1": _as_price(quote.get("ask1")),
+        "change_pct": _as_float(quote.get("change_pct") or snapshot.get("change_pct")),
+        "source": quote.get("source") or snapshot.get("source"),
+        "bar_count": int(snapshot.get("bar_count", 0) or 0),
+        "ma": snapshot.get("ma") or {},
+        "above_ma": snapshot.get("above_ma") or [],
+        "crossed_up_ma": snapshot.get("crossed_up_ma") or [],
+        "ma120": _as_price(snapshot.get("ma120_1m") or snapshot.get("ma120")),
+        "vwap": _as_price(snapshot.get("vwap")),
+        "rsi14": _as_float(snapshot.get("rsi14")),
+        "macd_dif": _as_float(snapshot.get("macd_dif")),
+        "macd_dea": _as_float(snapshot.get("macd_dea")),
+        "macd_hist": _as_float(snapshot.get("macd_hist")),
+        "kdj_k": _as_float(snapshot.get("kdj_k")),
+        "kdj_d": _as_float(snapshot.get("kdj_d")),
+        "kdj_j": _as_float(snapshot.get("kdj_j")),
+        "high_retreat_pct": _as_float(snapshot.get("high_retreat_pct")),
+        "vwap_distance_pct": _as_float(snapshot.get("vwap_distance_pct")),
+    }
+    return {key: value for key, value in result.items() if value not in (None, "", [], {})}
+
+
+def _append_buy_timing_event(
+    event_type: str,
+    *,
+    stock: str = "",
+    now: datetime = None,
+    decision: Dict = None,
+    market: Dict = None,
+    order: Dict = None,
+    error: Any = None,
+    details: Dict = None,
+) -> None:
+    if os.getenv("INTRADAY_BUY_AUDIT_ENABLED", "1") != "1":
+        return
+    now = now or datetime.now()
+    event = {
+        "schema_version": 1,
+        "event_id": f"{now.strftime('%Y%m%d%H%M%S%f')}:{os.getpid()}:{time.time_ns()}",
+        "date": now.date().isoformat(),
+        "time": now.isoformat(),
+        "event_type": str(event_type),
+        "stock": str(stock or ""),
+    }
+    if decision:
+        compact = _compact_timing_decision(decision, now)
+        compact["llm_status"] = decision.get("_llm_status") or decision.get("llm_status")
+        compact["llm_error_type"] = decision.get("_llm_error_type") or decision.get("llm_error_type")
+        compact["llm_started_at"] = decision.get("_llm_started_at") or decision.get("llm_started_at")
+        compact["llm_finished_at"] = decision.get("_llm_finished_at") or decision.get("llm_finished_at")
+        compact["llm_latency_seconds"] = decision.get("_llm_latency_seconds") or decision.get("llm_latency_seconds")
+        event["decision"] = {key: value for key, value in compact.items() if value not in (None, "")}
+    if market:
+        event["market"] = market
+    if order:
+        event["order"] = order
+    if error not in (None, ""):
+        event["error"] = str(error)[:1000]
+    if details:
+        event["details"] = details
+    path = _buy_timing_event_file(now.date())
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+            handle.flush()
+            if event_type in {"TASK_START", "TASK_END", "TASK_ERROR", "ORDER_SUBMIT", "ORDER_CANCEL", "ORDER_FILL"}:
+                os.fsync(handle.fileno())
+    except Exception as exc:
+        logger.warning(f"盘中买入审计事件写入失败 {event_type} {stock}: {exc}")
+
+
+def _load_buy_timing_market_buffer(day: date) -> Dict[str, Any]:
+    global _BUY_TIMING_MARKET_BUFFER
+    if _BUY_TIMING_MARKET_BUFFER.get("date") == day.isoformat():
+        return _BUY_TIMING_MARKET_BUFFER
+    path = _buy_timing_market_file(day)
+    loaded: Dict[str, Any] = {}
+    if path.exists():
+        try:
+            with gzip.open(path, "rt", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+        except Exception as exc:
+            logger.warning(f"盘中分钟行情包读取失败，将重建: {exc}")
+    if not isinstance(loaded, dict) or loaded.get("date") != day.isoformat():
+        loaded = {"schema_version": 1, "date": day.isoformat(), "stocks": {}}
+    loaded.setdefault("stocks", {})
+    _BUY_TIMING_MARKET_BUFFER = loaded
+    return _BUY_TIMING_MARKET_BUFFER
+
+
+def _flush_buy_timing_market(day: date = None, force: bool = False) -> None:
+    global _BUY_TIMING_MARKET_LAST_FLUSH
+    if os.getenv("INTRADAY_BUY_AUDIT_ENABLED", "1") != "1":
+        return
+    day = day or date.today()
+    buffer = _load_buy_timing_market_buffer(day)
+    interval = max(30, int(os.getenv("INTRADAY_BUY_MARKET_FLUSH_SECONDS", "300")))
+    if not force and time.monotonic() - _BUY_TIMING_MARKET_LAST_FLUSH < interval:
+        return
+    path = _buy_timing_market_file(day)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    buffer["updated_at"] = datetime.now().isoformat()
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with gzip.open(tmp_path, "wt", encoding="utf-8") as handle:
+            json.dump(buffer, handle, ensure_ascii=False, separators=(",", ":"), default=str)
+        os.replace(tmp_path, path)
+        _BUY_TIMING_MARKET_LAST_FLUSH = time.monotonic()
+    except Exception as exc:
+        logger.warning(f"盘中分钟行情包写入失败: {exc}")
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+
+
+def _cache_buy_timing_market(stock: str, bars: List[Dict], quote: Dict, now: datetime) -> None:
+    if os.getenv("INTRADAY_BUY_AUDIT_ENABLED", "1") != "1":
+        return
+    if not stock:
+        return
+    buffer = _load_buy_timing_market_buffer(now.date())
+    stock_data = buffer.setdefault("stocks", {}).setdefault(stock, {"bars": []})
+    merged = {
+        str(row.get("time")): row
+        for row in stock_data.get("bars") or []
+        if isinstance(row, dict) and row.get("time")
+    }
+    for bar in bars or []:
+        bar_time = _bar_time_value(bar.get("time"))
+        if not bar_time or bar_time.date() != now.date():
+            continue
+        close = _as_price(bar.get("close"))
+        if close is None or close <= 0:
+            continue
+        merged[bar_time.isoformat()] = {
+            "time": bar_time.isoformat(),
+            "open": _as_price(bar.get("open"), close),
+            "high": _as_price(bar.get("high"), close),
+            "low": _as_price(bar.get("low"), close),
+            "close": close,
+            "volume": _as_float(bar.get("volume"), 0.0),
+        }
+    stock_data["bars"] = [merged[key] for key in sorted(merged)]
+    stock_data["last_quote"] = _compact_audit_market(quote)
+    stock_data["updated_at"] = now.isoformat()
+    _flush_buy_timing_market(now.date())
+
+
 def _pid_alive(pid: Any) -> bool:
     try:
         pid_int = int(pid)
@@ -2303,6 +2510,7 @@ def _should_keep_missing_pending_order(entry: Dict, now: datetime = None) -> boo
 
 
 def _record_buy_timing_decision(entry: Dict, decision: Dict, now: datetime = None) -> None:
+    now = now or datetime.now()
     compact = _compact_timing_decision(decision, now)
     entry["last_decision"] = compact
     entry["last_decision_at"] = entry["last_decision"]["time"]
@@ -2310,6 +2518,24 @@ def _record_buy_timing_decision(entry: Dict, decision: Dict, now: datetime = Non
     if not compact.get("llm_skipped") and (compact.get("llm_model") or compact.get("llm_path")):
         entry["last_llm_decision"] = dict(compact)
         entry["last_llm_decision_at"] = compact.get("time")
+    is_llm_decision = bool(
+        compact.get("llm_model")
+        or compact.get("llm_path")
+        or decision.get("_llm_status")
+        or decision.get("llm_status")
+    )
+    event_type = "LLM_DECISION" if is_llm_decision else "RULE_DECISION"
+    if compact.get("llm_skipped"):
+        event_type = "POLL_SKIP"
+    market = decision.get("market_snapshot") if isinstance(decision.get("market_snapshot"), dict) else None
+    audit_now = _parse_state_datetime(decision.get("_llm_finished_at") or decision.get("llm_finished_at")) or now
+    _append_buy_timing_event(
+        event_type,
+        stock=str(entry.get("stock") or ""),
+        now=audit_now,
+        decision=decision,
+        market=market,
+    )
 
 
 def _compact_buy_timing_state(state: Dict) -> Dict:
@@ -2403,6 +2629,7 @@ def _save_buy_timing_state(state: Dict, path: Path = None):
 
 def _state_entry(state: Dict, stock: str) -> Dict:
     entry = state.setdefault("stocks", {}).setdefault(stock, {})
+    entry.setdefault("stock", stock)
     entry.setdefault("status", "open")
     entry.setdefault("reprice_count", 0)
     return entry
@@ -2677,11 +2904,11 @@ def _calc_bollinger(closes: List[float], period: int = 20, k: float = 2.0) -> tu
     return round(middle + k * std, 4), round(middle, 4), round(middle - k * std, 4)
 
 
-def _intraday_technical_snapshot(stock: str, quote: Dict, bars: List[Dict]) -> Dict:
+def _intraday_technical_snapshot(stock: str, quote: Dict, bars: List[Dict], trading_day: date = None) -> Dict:
     from datetime import date
 
     all_bars_sorted = sorted([b for b in bars if b.get("time") is not None], key=lambda b: b["time"])
-    today = date.today()
+    today = trading_day or date.today()
     today_bars = [b for b in all_bars_sorted if b.get("time") and b["time"].date() == today]
     other_bars = [b for b in all_bars_sorted if b.get("time") and b["time"].date() != today]
 
@@ -2761,6 +2988,10 @@ def _intraday_technical_snapshot(stock: str, quote: Dict, bars: List[Dict]) -> D
     return {
         "stock": stock,
         "bar_count": len(today_bars),
+        "last_day_bar_count": len(last_day_bars),
+        "first_today_bar_time": today_bars[0]["time"].isoformat() if today_bars else None,
+        "last_today_bar_time": today_bars[-1]["time"].isoformat() if today_bars else None,
+        "opening_sequence_ready": bool(today_bars and len(last_day_bars) >= 120),
         "latest": latest,
         "day_open": day_open,
         "prev_bar_close": prev_bar_close,
@@ -2810,7 +3041,12 @@ def _opening_strong_buy_decision(snapshot: Dict) -> Optional[Dict]:
     above_ma_count = len(snapshot.get("above_ma") or [])
     crossed_count = len(snapshot.get("crossed_up_ma") or [])
     close_to_high = (snapshot.get("high_retreat_pct") is None) or snapshot.get("high_retreat_pct") >= -1.2
-    if rising and close_to_high and (above_ma_count >= 3 or crossed_count >= 2 or snapshot.get("bar_count", 0) < 5):
+    if (
+        snapshot.get("opening_sequence_ready")
+        and rising
+        and close_to_high
+        and (above_ma_count >= 3 or crossed_count >= 2)
+    ):
         ma_text = ",".join(snapshot.get("above_ma") or snapshot.get("crossed_up_ma") or ["开盘上涨"])
         return {
             "action": "BUY_NOW",
@@ -2825,7 +3061,11 @@ def _opening_strong_buy_decision(snapshot: Dict) -> Optional[Dict]:
 
 
 def _opening_snapshot_ready(snapshot: Dict) -> bool:
-    return bool(_as_float(snapshot.get("latest")) and _as_float(snapshot.get("day_open")))
+    return bool(
+        _as_float(snapshot.get("latest"))
+        and _as_float(snapshot.get("day_open"))
+        and snapshot.get("opening_sequence_ready")
+    )
 
 
 
@@ -3083,7 +3323,7 @@ def _run_realtime_hard_trigger_loop(signals: list, name_map: dict, state: dict, 
     return None
 
 def _technical_buy_timing_decision(signal: Dict, quote: Dict, bars: List[Dict], entry: Dict, now: datetime, pending_order: Dict = None) -> Optional[Dict]:
-    snapshot = _intraday_technical_snapshot(signal.get("stock", ""), quote, bars)
+    snapshot = _intraday_technical_snapshot(signal.get("stock", ""), quote, bars, trading_day=now.date())
     pending_decision = _pending_order_review_decision(entry, pending_order or {}, now)
     if pending_decision:
         return pending_decision
@@ -3356,7 +3596,13 @@ def call_llm_buy_timing_decision(signal: Dict, quote: Dict, pending_order: Dict 
         timeout = int(os.getenv("INTRADAY_BUY_TIMING_LLM_TIMEOUT", "90"))
     except Exception as e:
         logger.warning(f"LLM分时买入提示词构建失败 {signal.get('stock')}: {e}")
-        return {"action": "WAIT", "confidence": 0, "reason": f"LLM提示词构建失败，保守等待: {e}"}
+        return {
+            "action": "WAIT",
+            "confidence": 0,
+            "reason": f"LLM提示词构建失败，保守等待: {e}",
+            "_llm_status": "failed",
+            "_llm_error_type": "prompt_build_error",
+        }
 
     primary_model = str(INTRADAY_BUY_TIMING_LLM_MODEL or "")
     fallback_model = str(INTRADAY_BUY_TIMING_LLM_FALLBACK_MODEL or "")
@@ -3384,6 +3630,7 @@ def call_llm_buy_timing_decision(signal: Dict, quote: Dict, pending_order: Dict 
             if parsed:
                 parsed["_llm_model"] = primary_model
                 parsed["_llm_path"] = f"minimax_thinking_text:{label}"
+                parsed["_llm_status"] = "ok"
                 logger.info(f"LLM分时买入MiniMax文本解析成功 {signal.get('stock')}: {parsed.get('action')} ({label})")
                 return parsed
             logger.warning(
@@ -3418,6 +3665,7 @@ def call_llm_buy_timing_decision(signal: Dict, quote: Dict, pending_order: Dict 
             if parsed:
                 parsed["_llm_model"] = primary_model
                 parsed["_llm_path"] = "minimax_thinking_text:format_retry"
+                parsed["_llm_status"] = "ok"
                 logger.info(f"LLM分时买入MiniMax格式重试解析成功 {signal.get('stock')}: {parsed.get('action')}")
                 return parsed
             logger.warning(
@@ -3448,6 +3696,7 @@ def call_llm_buy_timing_decision(signal: Dict, quote: Dict, pending_order: Dict 
         result = _decision_to_dict(decision)
         result["_llm_model"] = model
         result["_llm_path"] = label
+        result["_llm_status"] = "ok"
         logger.info(f"LLM分时买入决策({model}, {label})成功 {signal.get('stock')}: {result.get('action')}")
         return result
 
@@ -3469,9 +3718,17 @@ def call_llm_buy_timing_decision(signal: Dict, quote: Dict, pending_order: Dict 
                 if fallback_result:
                     return fallback_result
             except Exception as fallback_error:
-                logger.warning(f"LLM分时买入GPT-5.5兜底失败 {signal.get('stock')}: {fallback_error}")
+                logger.warning(f"LLM分时买入GPT-5.6 Sol兜底失败 {signal.get('stock')}: {fallback_error}")
         logger.warning(f"LLM分时买入({primary_model})文本解析和备用模型均失败 {signal.get('stock')}")
-        return {"action": "WAIT", "confidence": 0, "reason": "LLM无有效结构化输出，保守等待"}
+        return {
+            "action": "WAIT",
+            "confidence": 0,
+            "reason": "LLM无有效结构化输出，保守等待",
+            "_llm_model": primary_model,
+            "_llm_path": "all_paths_failed",
+            "_llm_status": "failed",
+            "_llm_error_type": "parse_or_provider_error",
+        }
 
     try:
         result = _try_structured_decision(
@@ -3483,10 +3740,26 @@ def call_llm_buy_timing_decision(signal: Dict, quote: Dict, pending_order: Dict 
         if result:
             return result
         logger.warning(f"LLM分时买入({primary_model})无有效结构化输出 {signal.get('stock')}")
-        return {"action": "WAIT", "confidence": 0, "reason": "LLM无有效结构化输出，保守等待"}
+        return {
+            "action": "WAIT",
+            "confidence": 0,
+            "reason": "LLM无有效结构化输出，保守等待",
+            "_llm_model": primary_model,
+            "_llm_path": "structured_empty",
+            "_llm_status": "failed",
+            "_llm_error_type": "empty_output",
+        }
     except Exception as e:
         logger.warning(f"LLM分时买入决策(thinking模式)失败 {signal.get('stock')}: {e}")
-        return {"action": "WAIT", "confidence": 0, "reason": f"LLM决策失败，保守等待: {e}"}
+        return {
+            "action": "WAIT",
+            "confidence": 0,
+            "reason": f"LLM决策失败，保守等待: {e}",
+            "_llm_model": primary_model,
+            "_llm_path": "structured_exception",
+            "_llm_status": "failed",
+            "_llm_error_type": type(e).__name__,
+        }
 
 
 
@@ -3774,6 +4047,18 @@ def _mark_buy_timing_entry_filled(entry: Dict, api_order: Dict) -> None:
     compact = _compact_order(api_order)
     if compact:
         entry["last_order"] = compact
+    fill_time = _parse_state_datetime(api_order.get("order_time")) or datetime.now()
+    _append_buy_timing_event(
+        "ORDER_FILL",
+        stock=str(entry.get("stock") or api_order.get("stock") or ""),
+        now=fill_time,
+        order={
+            "order_id": order_id,
+            "filled_price": entry.get("filled_price"),
+            "filled_quantity": entry.get("filled_quantity"),
+            "status": _order_status_text(api_order),
+        },
+    )
 
 
 def _repair_filled_timing_entry_identity(entry: Dict) -> None:
@@ -3910,6 +4195,16 @@ def _cancel_timing_pending_orders(state: Dict, reason: str = "截止时间未成
         stock = order.get("stock", "")
         entry = _state_entry(state, stock)
         result = cancel_buy_order(_extract_order_id(order), stock, reason)
+        _append_buy_timing_event(
+            "ORDER_CANCEL",
+            stock=stock,
+            order={
+                "order_id": _extract_order_id(order),
+                "status": result.get("status"),
+                "error": result.get("error"),
+                "reason": reason,
+            },
+        )
         entry["last_cancellation"] = {
             "time": datetime.now().isoformat(),
             "reason": reason,
@@ -3936,6 +4231,11 @@ def _run_buy_timing_round(
 ) -> float:
     now = now or datetime.now()
     signals_by_stock = {s.get("stock"): s for s in signals if s.get("stock")}
+    _append_buy_timing_event(
+        "ROUND_HEARTBEAT",
+        now=now,
+        details={"active_stocks": sorted(stock for stock in signals_by_stock if stock)},
+    )
     tracked_orders = _has_buy_timing_trackable_orders(state, signals_by_stock)
     # 没有本地可追踪挂单时，不在每分钟技术检查前查 /orders。
     # 真正准备 BUY_NOW 前会再强制查询一次委托，做重复下单保护。
@@ -4074,6 +4374,7 @@ def _run_buy_timing_round(
             quote = get_intraday_buy_quote(stock)
             if not quote:
                 decision = {"action": "WAIT", "confidence": 0, "reason": "实时行情获取失败，保守等待"}
+                _append_buy_timing_event("MARKET_DATA_ERROR", stock=stock, now=now, error="实时行情获取失败")
                 _record_buy_timing_decision(entry, decision, now)
                 round_summary["decisions"].append({"stock": stock, **decision})
                 continue
@@ -4081,6 +4382,7 @@ def _run_buy_timing_round(
             has_pending = bool(pending_order)
             bars = get_intraday_1m_bars(stock, count=500)
             technical_snapshot = _intraday_technical_snapshot(stock, quote, bars)
+            _cache_buy_timing_market(stock, bars, quote, now)
             # 注入大盘指数和板块数据
             technical_snapshot["_index_data"] = state.get("_round_index_data", {})
             technical_snapshot["_board_data"] = state.get("_round_board_data", {})
@@ -4089,7 +4391,19 @@ def _run_buy_timing_round(
                 technical_trigger = decision.get("technical_trigger")
                 trigger_detail = decision.get("trigger_detail")
                 if _is_technical_llm_due(entry, technical_trigger, now):
+                    llm_started = datetime.now()
+                    _append_buy_timing_event(
+                        "TECHNICAL_TRIGGER",
+                        stock=stock,
+                        now=llm_started,
+                        decision=decision,
+                        market=_compact_audit_market(quote, technical_snapshot),
+                    )
                     decision = call_llm_buy_timing_decision(signal, quote, pending_order, now, technical_snapshot)
+                    llm_finished = datetime.now()
+                    decision["_llm_started_at"] = llm_started.isoformat()
+                    decision["_llm_finished_at"] = llm_finished.isoformat()
+                    decision["_llm_latency_seconds"] = round((llm_finished - llm_started).total_seconds(), 3)
                     decision["technical_trigger"] = decision.get("technical_trigger") or technical_trigger
                     decision["trigger_detail"] = decision.get("trigger_detail") or trigger_detail
                     entry["last_llm_check_at"] = now.isoformat()
@@ -4111,7 +4425,12 @@ def _run_buy_timing_round(
                     }
             elif decision is None:
                 if _is_buy_timing_llm_due(entry, now):
+                    llm_started = datetime.now()
                     decision = call_llm_buy_timing_decision(signal, quote, pending_order, now, technical_snapshot)
+                    llm_finished = datetime.now()
+                    decision["_llm_started_at"] = llm_started.isoformat()
+                    decision["_llm_finished_at"] = llm_finished.isoformat()
+                    decision["_llm_latency_seconds"] = round((llm_finished - llm_started).total_seconds(), 3)
                     entry["last_llm_check_at"] = now.isoformat()
                 else:
                     decision = {
@@ -4140,6 +4459,12 @@ def _run_buy_timing_round(
                 "llm_skipped": bool(decision.get("llm_skipped")),
                 "_llm_model": decision.get("_llm_model") or decision.get("llm_model"),
                 "_llm_path": decision.get("_llm_path") or decision.get("llm_path"),
+                "_llm_status": decision.get("_llm_status") or decision.get("llm_status"),
+                "_llm_error_type": decision.get("_llm_error_type") or decision.get("llm_error_type"),
+                "_llm_started_at": decision.get("_llm_started_at") or decision.get("llm_started_at"),
+                "_llm_finished_at": decision.get("_llm_finished_at") or decision.get("llm_finished_at"),
+                "_llm_latency_seconds": decision.get("_llm_latency_seconds") or decision.get("llm_latency_seconds"),
+                "market_snapshot": _compact_audit_market(quote, technical_snapshot),
             }
             _record_buy_timing_decision(entry, decision, now)
             round_summary["decisions"].append({"stock": stock, **decision})
@@ -4163,6 +4488,17 @@ def _run_buy_timing_round(
                     continue
 
                 cancel_result = cancel_buy_order(_extract_order_id(pending_order), stock, decision.get("reason", "LLM建议撤单"))
+                _append_buy_timing_event(
+                    "ORDER_CANCEL",
+                    stock=stock,
+                    now=now,
+                    order={
+                        "order_id": _extract_order_id(pending_order),
+                        "status": cancel_result.get("status"),
+                        "error": cancel_result.get("error"),
+                        "reason": decision.get("reason", "LLM建议撤单"),
+                    },
+                )
                 entry["last_cancellation"] = {
                     "time": now.isoformat(),
                     "reason": decision.get("reason", "LLM建议撤单"),
@@ -4198,6 +4534,13 @@ def _run_buy_timing_round(
                 today_orders = get_today_orders(force=True)
                 orders_snapshot_ok = today_orders.get("_ok") is not False
             if not orders_snapshot_ok and not cancelled_pending_this_round:
+                _append_buy_timing_event(
+                    "ORDER_BLOCKED",
+                    stock=stock,
+                    now=now,
+                    error="买入前当日委托查询失败",
+                    details={"category": "order_snapshot"},
+                )
                 _record_buy_timing_decision(entry, {
                     "action": "WAIT",
                     "price_mode": "NONE",
@@ -4242,6 +4585,13 @@ def _run_buy_timing_round(
             available_cash = _get_available_cash()
             if available_cash is None:
                 logger.warning(f"{stock} 获取可用资金失败，跳过本轮")
+                _append_buy_timing_event(
+                    "ORDER_BLOCKED",
+                    stock=stock,
+                    now=now,
+                    error="获取可用资金失败",
+                    details={"category": "cash_snapshot"},
+                )
                 entry["status"] = "open"
                 entry["last_skip_reason"] = "获取可用资金失败"
                 continue
@@ -4251,6 +4601,12 @@ def _run_buy_timing_round(
 
             order_plan = _calc_timing_buy_order(signal, quote, initial_cash, available_cash, decision)
             if not order_plan.get("ok"):
+                _append_buy_timing_event(
+                    "ORDER_BLOCKED",
+                    stock=stock,
+                    now=now,
+                    details={"category": "order_plan", "reason": order_plan.get("reason")},
+                )
                 entry["status"] = "open"
                 entry["last_skip_reason"] = order_plan.get("reason")
                 continue
@@ -4267,6 +4623,22 @@ def _run_buy_timing_round(
             reason_prefix = "技术触发买入" if decision.get("technical_trigger") else "LLM分时买入"
             reason = f"{reason_prefix}: {decision.get('reason', '')}"
             result = buy_stock(stock, name, order_plan["order_price"], order_plan["quantity"], reason)
+            _append_buy_timing_event(
+                "ORDER_SUBMIT",
+                stock=stock,
+                now=now,
+                order={
+                    "order_id": result.get("order_id"),
+                    "order_price": order_plan.get("order_price"),
+                    "raw_order_price": order_plan.get("raw_order_price"),
+                    "quote_price": quote.get("price"),
+                    "quantity": order_plan.get("quantity"),
+                    "status": result.get("status"),
+                    "error": result.get("error"),
+                    "reason": reason,
+                },
+                market=_compact_audit_market(quote, technical_snapshot),
+            )
             if result.get("status") in {"submitted", "dry_run"}:
                 pending_record = {
                     "time": now.isoformat(),
@@ -4312,6 +4684,7 @@ def _buy_timing_finished_today(now: datetime = None) -> bool:
 
 
 def run_buy_timing_mode():
+    setup_logging()
     now = datetime.now()
     if _should_skip_non_trading_day("分时买入", now):
         return 0
@@ -4336,6 +4709,10 @@ def run_buy_timing_mode():
     try:
         _run_buy_timing_mode_unlocked()
         return 0
+    except Exception as exc:
+        _append_buy_timing_event("TASK_ERROR", error=exc, details={"fatal": True})
+        _flush_buy_timing_market(force=True)
+        raise
     finally:
         _release_buy_timing_process_lock(lock)
 
@@ -4361,13 +4738,20 @@ def _run_buy_timing_mode_unlocked():
     logger.info("=" * 50)
     logger.info("Phase 4: 技术优先分时买入模式")
     logger.info("=" * 50)
+    _append_buy_timing_event("TASK_START", now=now, details={"stage": "initializing"})
 
     if not API_KEY:
         logger.error("MX_APIKEY 未设置")
+        _append_buy_timing_event("TASK_ERROR", now=now, error="MX_APIKEY 未设置", details={"fatal": True})
         feishu_push("⚠️ MX_APIKEY 未配置,无法执行分时买入")
         return
 
     if _should_skip_non_trading_day("分时买入", now):
+        _append_buy_timing_event(
+            "TASK_END",
+            now=now,
+            details={"status": "skipped", "reason": "non_trading_day"},
+        )
         return
 
     today_str = date.today().strftime("%Y%m%d")
@@ -4389,6 +4773,7 @@ def _run_buy_timing_mode_unlocked():
     if not today_signals and not carryover_signals:
         report = _load_ready_daily_report_for_timing(report_file)
         if not report:
+            _append_buy_timing_event("TASK_END", details={"status": "skipped", "reason": "daily_report_unavailable"})
             return
         phase2 = report.get("phase2", {})
         ranked = phase2.get("ranked_candidates", [])
@@ -4401,6 +4786,7 @@ def _run_buy_timing_mode_unlocked():
         carryover_signals = _carryover_intraday_timing_signals(today_signals, date.today())
     signals = _merge_intraday_timing_pool(today_signals, carryover_signals)
     if not signals:
+        _append_buy_timing_event("TASK_END", details={"status": "skipped", "reason": "empty_watch_pool"})
         feishu_push(f"📋 {date.today()} 分时买入\n今日早报Top5和昨日未成交顺延池均为空，跳过")
         return
     for s in carryover_signals:
@@ -4417,6 +4803,27 @@ def _run_buy_timing_mode_unlocked():
     if not state.get("initial_cash"):
         state.pop("initial_cash", None)
     _save_buy_timing_state(state)
+    _append_buy_timing_event(
+        "WATCH_POOL_READY",
+        details={
+            "selected_stocks": state.get("selected_stocks") or [],
+            "daily_top5_count": len(today_signals),
+            "carryover_count": len(carryover_signals),
+        },
+    )
+    for signal in signals:
+        _append_buy_timing_event(
+            "WATCH_POOL_ADD",
+            stock=str(signal.get("stock") or ""),
+            details={
+                "name": signal.get("name"),
+                "source": "carryover" if signal.get("carryover_from") else "daily_top5",
+                "carryover_from": signal.get("carryover_from"),
+                "signal": signal.get("signal") or signal.get("action"),
+                "confidence": signal.get("confidence"),
+                "buy_score": signal.get("buy_score"),
+            },
+        )
 
     once = os.getenv("INTRADAY_BUY_TIMING_ONCE") == "1"
     feishu_push(
@@ -4473,6 +4880,7 @@ def _run_buy_timing_mode_unlocked():
             state["consecutive_round_errors"] = 0
         except Exception as e:
             logger.exception(f"分时买入本轮异常，已跳过本轮并继续下一轮: {e}")
+            _append_buy_timing_event("ROUND_ERROR", now=datetime.now(), error=e)
             errors = state.setdefault("round_errors", [])
             errors.append({
                 "time": datetime.now().isoformat(),
@@ -4504,6 +4912,7 @@ def _run_buy_timing_mode_unlocked():
         _cancel_timing_pending_orders(state, f"{_buy_timing_cutoff().strftime('%H:%M')}截止仍未成交", set(signals_by_stock.keys()))
     state["finished_at"] = datetime.now().isoformat()
     _save_buy_timing_state(state)
+    _flush_buy_timing_market(force=True)
 
     status_counts = {}
     for stock in state.get("selected_stocks", []):
@@ -4518,6 +4927,10 @@ def _run_buy_timing_mode_unlocked():
         name = name_map.get(stock, stock)
         filled = f" 成交{entry.get('filled_quantity')}股@{entry.get('filled_price')}" if entry.get("status") == "filled" else ""
         lines.append(f"{stock} {name}: {entry.get('status')}{filled}")
+    _append_buy_timing_event(
+        "TASK_END",
+        details={"status_counts": status_counts, "selected_stocks": state.get("selected_stocks") or []},
+    )
     feishu_push("\n".join(lines))
 
 
@@ -4867,6 +5280,7 @@ def _build_lot_states(record: Dict, fallback_price: float, fallback_quantity: in
 # ── Mode: monitor ────────────────────────────────────────
 
 def run_monitor_mode():
+    setup_logging()
     """
     持仓监控模式(每天 14:50 触发)
     1. 获取当前持仓
@@ -5382,6 +5796,7 @@ def run_monitor_mode():
 # ── Mode: status ─────────────────────────────────────────
 
 def run_status_mode():
+    setup_logging()
     """查看当前持仓状态"""
     logger.info("=" * 50)
     logger.info("Phase 4: 持仓状态查询")
@@ -5435,6 +5850,7 @@ def run_status_mode():
 # ── Mode: check (盘中实时查询) ────────────────────────────
 
 def run_check_mode():
+    setup_logging()
     """
     盘中实时查询模式
     你可以随时问我:「帮我看看持仓」「要不要卖某股」
@@ -5501,6 +5917,7 @@ def run_check_mode():
     feishu_push(status_text)
 
 if __name__ == "__main__":
+    setup_logging()
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["buy", "buy-timing", "buy-legacy", "monitor", "check", "status"], default="buy-timing")

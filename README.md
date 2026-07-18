@@ -2,6 +2,8 @@
 
 [中文文档](README.zh-CN.md)
 
+Current release: **v0.2.0** · [Changelog](CHANGELOG.md) · [Release notes](docs/releases/v0.2.0.md)
+
 An experimental A-share stock-selection workflow that combines market data,
 news/context collection, multi-factor LLM scoring, backtesting, intraday
 execution helpers, and weekly review loops.
@@ -9,6 +11,15 @@ execution helpers, and weekly review loops.
 This repository is a sanitized public version. Runtime reports, logs, account
 state, broker exports, API keys, webhook URLs, and local machine paths are not
 included.
+
+## What's New in v0.2.0
+
+- Versioned data-routing contracts expose source, freshness, fallback, and missing-data status.
+- Deterministic market snapshots provide traceable MA, RSI, MACD, KDJ, ATR, volume, and price-position evidence.
+- Evidence-bound knowledge rules and historical edge overlays improve scoring without hiding the adjustment source.
+- Workflow checkpoints can resume by candidate universe, screening signature, scoring version, and debate node.
+- Central model routing supports primary and fallback models through environment configuration.
+- Intraday decision events and weekly execution attribution make buy-timing behavior auditable.
 
 ## Workflow
 
@@ -108,10 +119,27 @@ Important environment variables are documented in `.env.example`.
 - `DRY_RUN=1` is the recommended starting mode.
 - `MX_APIKEY`, `MINIMAX_API_KEY`, `MX_DIRECT_KEY`, `VOLCAN_API_KEY`, and
   `VOLCAN_ENGINE_API_KEY` are optional provider keys depending on which model
-  and data paths you enable.
+  and data paths you enable. Use `OPENAI_API_KEY` for OpenAI API routes.
+- `STOCK_SELECTION_DEFAULT_MODEL`, `STOCK_SELECTION_FALLBACK_MODEL`, and
+  `STOCK_SELECTION_SECONDARY_FALLBACK_MODEL` control the model cascade.
 - `FEISHU_WEBHOOK_URL` enables Feishu notification pushes.
 - `QMT_HTTP_URL` and `XQSHARE_HTTP_BASE` point to your local market/trading
   bridge. Public defaults use `127.0.0.1` placeholders.
+
+## Focused Offline Checks
+
+```bash
+python3 -m compileall -q .
+python3 test_market_snapshot_router.py
+python3 test_knowledge_rules.py
+python3 test_candidate_edge_rules.py
+python3 test_workflow_refactor_contracts.py
+python3 test_selection_correctness_v3.py
+```
+
+Run these checks before publishing changes. Tests that need live market data,
+model providers, or a local bridge should be run separately in the environment
+that provides those services.
 
 ## Runtime Files
 
@@ -122,6 +150,9 @@ Generated files stay local and are ignored by Git:
 - `runtime_archive/`
 - `knowledge-base/*.json`
 - `weekly_strategy/checkpoints/*.json`
+
+The repository version is stored in `VERSION`. User-facing changes are recorded
+in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

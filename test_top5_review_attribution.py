@@ -141,6 +141,9 @@ def test_build_review_with_core_attributions():
         assert "MONEY_FLOW_MISLEAD" in items["000003"]["attribution_labels"], items["000003"]
         assert "QUANT_OVER_SCORE" in items["000004"]["attribution_labels"], items["000004"]
         assert review["summary"]["top5_count"] == 4
+        assert review["intraday_buy_review"]["status"] == "ok"
+        assert review["intraday_buy_review"]["summary"]["observed_stock_count"] == 4
+        assert "盘中买入复盘" in mod.format_feishu_text(review)
 
 
 def test_llm_deep_analysis_is_attached_without_network():
@@ -161,10 +164,12 @@ def test_llm_deep_analysis_is_attached_without_network():
             }
         })
         original = mod.run_llm_deep_analysis
+        original_min_samples = mod.MIN_LLM_MATURE_D5_SAMPLES
         try:
+            mod.MIN_LLM_MATURE_D5_SAMPLES = 0
             mod.run_llm_deep_analysis = lambda review, **kwargs: {
                 "status": "ok",
-                "model": "GPT-5.5",
+                "model": "GPT-5.6 Sol",
                 "overall_conclusion": "样本偏少，优先补齐行情数据后再判断。",
                 "root_causes": ["行情数据缺失", "样本不足"],
                 "priority_fixes": ["修复XQShare行情源"],
@@ -178,12 +183,180 @@ def test_llm_deep_analysis_is_attached_without_network():
                 minute_fetcher=lambda code, day: None,
                 enable_money_flow_backfill=False,
             )
-            assert review["llm_deep_analysis"]["model"] == "GPT-5.5"
+            assert review["llm_deep_analysis"]["model"] == "GPT-5.6 Sol"
             text = mod.format_feishu_text(review)
             assert "LLM深度解读" in text
             assert "样本偏少" in text
         finally:
             mod.run_llm_deep_analysis = original
+            mod.MIN_LLM_MATURE_D5_SAMPLES = original_min_samples
+
+
+def test_incomplete_returns_and_embedded_backtest_are_not_counted():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        out = base / "output"
+        _write(out / "daily_report_20260601.json", {
+            "phase2": {"top_picks": [{
+                "stock": "000001",
+                "name": "样本",
+                "money_flow": {"main_net_flow": 1, "super_net_flow": 1, "ddx_5": 1, "ddy_10": 1},
+                "strategy_backtest": {"return_pct": 10.0, "entry_price": 10, "exit_price": 11},
+            }]}
+        })
+        review = mod.build_review(
+            base_dir=base,
+            daily_fetcher=lambda *_args, **_kwargs: [],
+            minute_fetcher=lambda *_args, **_kwargs: None,
+            enable_money_flow_backfill=False,
+        )
+        item = review["items"][0]
+        assert item["future_returns_pct"]["d5"] is None
+        assert item["future_return_complete"]["d5"] is False
+        assert item["reference_source"] == "unavailable"
+        assert "DATA_QUALITY_ISSUE" in item["attribution_labels"]
+        assert review["summary"]["returns"]["d5"]["mature_sample_count"] == 0
+
+
+def test_trade_review_aggregates_same_day_lots():
+    records = [
+        {"stock": "000001", "buy_date": "2026-06-01", "buy_price": 10, "quantity": 100, "remaining_quantity": 100, "sells": []},
+        {"stock": "000001", "buy_date": "2026-06-01", "buy_price": 12, "quantity": 200, "remaining_quantity": 100,
+         "sells": [{"price": 13, "quantity": 100}]},
+    ]
+    result = mod._extract_trade_info(records, "000001", "20260601", 14)
+    assert result["actual_lot_count"] == 2
+    assert result["actual_quantity"] == 300
+    assert result["actual_remaining_quantity"] == 200
+    assert result["actual_buy_price"] == 11.3333
+    assert result["actual_return_pct_to_latest"] == 20.59
+
+
+def test_partial_money_flow_is_reported():
+    flow = {"main_net_flow": 1.0, "super_net_flow": 2.0, "ddx_5": None, "ddy_10": None}
+    assert mod._money_flow_missing_keys(flow) == ["ddx_5", "ddy_10"]
+    assert mod._money_flow_is_complete(flow) is False
+
+
+def test_selection_memory_quarantines_unverified_returns():
+    import selection_memory
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "selection_memory.jsonl"
+        path.write_text(json.dumps({
+            "report_date": "20260601",
+            "stock": "000001",
+            "return_d5_pct": 10.0,
+            "alpha_d5_pct": 8.0,
+        }, ensure_ascii=False) + "\n", encoding="utf-8")
+        review = {
+            "generated_at": "2026-07-11T08:00:00",
+            "items": [{
+                "date": "2026-06-01",
+                "stock": "000001",
+                "future_returns_pct": {"d5": None},
+                "future_return_complete": {"d5": False},
+                "future_return_dates": {"d5": None},
+            }],
+        }
+        assert selection_memory.update_selection_memory_from_top5_review(review, path=path) == 1
+        saved = json.loads(path.read_text(encoding="utf-8").strip())
+        assert saved["return_d5_pct"] is None
+        assert saved["alpha_d5_pct"] is None
+        assert saved["return_d5_complete"] is False
+
+
+def test_forward_memory_backfill_reaches_beyond_display_window():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        out = base / "output"
+        report_days = [
+            "20260601", "20260602", "20260603", "20260604", "20260605", "20260608",
+            "20260609", "20260610", "20260611", "20260612", "20260615", "20260616",
+        ]
+        for day in report_days:
+            picks = [{
+                "stock": "000001",
+                "name": "旧窗口样本",
+                "signal": "BUY",
+                "money_flow": {"main_net_flow": 1, "super_net_flow": 1, "ddx_5": 1, "ddy_10": 1},
+            }] if day == "20260601" else []
+            _write(out / f"daily_report_{day}.json", {"phase2": {"top_picks": picks}})
+        memory_path = out / "selection_memory.jsonl"
+        memory_path.write_text(json.dumps({
+            "report_date": "20260601",
+            "stock": "000001",
+            "top5_rank": 1,
+            "return_d10_complete": False,
+        }, ensure_ascii=False) + "\n", encoding="utf-8")
+
+        price_map = {
+            "000001": _daily_rows(10, [0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]),
+            "000300": _daily_rows(10, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        }
+        backfill = mod.build_forward_memory_backfill(
+            base_dir=base,
+            days=30,
+            daily_fetcher=lambda code, count=80: price_map.get(code, []),
+            minute_fetcher=lambda _code, _day: None,
+        )
+
+        assert backfill["summary"]["report_days_scanned"] == 12
+        assert backfill["summary"]["completed_records"] == 1
+        assert backfill["items"][0]["future_return_complete"]["d10"] is True
+        display_review = {
+            "generated_at": "2026-06-16T08:00:00",
+            "items": [],
+            "intraday_buy_review": {},
+            "forward_memory_backfill": dict(backfill["summary"]),
+        }
+        mod.save_review(
+            display_review,
+            output_dir=out,
+            memory_backfill_review=backfill,
+        )
+        saved = json.loads(memory_path.read_text(encoding="utf-8").strip())
+        assert saved["return_d10_complete"] is True
+        assert saved["return_d10_pct"] is not None
+        assert display_review["selection_memory"]["forward_records_updated"] == 1
+        assert display_review["forward_memory_backfill"]["records_updated"] == 1
+
+
+def test_daily_forward_summary_falls_back_to_mature_d5():
+    import workflow
+
+    old_output = workflow.OUTPUT_DIR
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            workflow.OUTPUT_DIR = Path(td)
+            rows = [
+                {
+                    "report_date": f"2026060{idx}",
+                    "stock": f"00000{idx}",
+                    "top5_rank": idx,
+                    "return_d5_pct": value,
+                    "return_d5_complete": True,
+                    "alpha_d5_pct": value - 0.5,
+                    "return_d10_pct": None,
+                    "return_d10_complete": False,
+                }
+                for idx, value in ((1, 3.0), (2, -1.0))
+            ]
+            (workflow.OUTPUT_DIR / "selection_memory.jsonl").write_text(
+                "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            result = workflow.run_backtest_strategy([{"stock": "999999"}])
+
+        assert result["status"] == "historical_forward_validation"
+        assert result["horizon"] == "d5"
+        assert result["requested_horizon"] == "d10"
+        assert result["fallback_used"] is True
+        assert result["sample_count"] == 2
+        assert result["avg_return_pct"] == 1.0
+        assert "暂用D5" in result["summary"]
+    finally:
+        workflow.OUTPUT_DIR = old_output
 
 
 def test_llm_deep_analysis_uses_minimax_structured_fallback():
@@ -191,8 +364,8 @@ def test_llm_deep_analysis_uses_minimax_structured_fallback():
 
     def fake_structured(prompt, model, *, fallback_used):
         calls.append(model)
-        if "gpt-5.5" in model:
-            return {"status": "failed", "model": "GPT-5.5", "error": "empty"}
+        if "gpt-5.6-sol" in model:
+            return {"status": "failed", "model": "GPT-5.6 Sol", "error": "empty"}
         return {
             "status": "ok",
             "model": "MiniMax-M3",
@@ -220,15 +393,47 @@ def test_llm_deep_analysis_uses_minimax_structured_fallback():
         assert result["status"] == "ok"
         assert result["model"] == "MiniMax-M3"
         assert result["fallback_used"] is True
-        assert calls == ["openai/gpt-5.5", "openai/gpt-5.5", "minimax-portal/MiniMax-M3"]
+        assert calls == ["openai/gpt-5.6-sol", "openai/gpt-5.6-sol", "minimax-portal/MiniMax-M3"]
     finally:
         mod._call_structured_deep_analysis = original_structured
         mod.time.sleep = original_sleep
         mod.DEFAULT_LLM_RETRIES = original_retries
 
 
+def test_llm_primary_model_uses_max_reasoning():
+    from stock_selection_debate import providers
+
+    captured = {}
+
+    def fake_call_structured(*args, **kwargs):
+        captured.update(kwargs)
+        return None
+
+    original = providers.call_structured
+    try:
+        providers.call_structured = fake_call_structured
+        result = mod._call_structured_deep_analysis(
+            "test prompt",
+            mod.DEFAULT_LLM_MODEL,
+            fallback_used=False,
+        )
+        assert result["status"] == "failed"
+        assert captured["model"] == "openai/gpt-5.6-sol"
+        assert captured["reasoning_effort"] == "max"
+        assert captured["allow_fallback"] is False
+    finally:
+        providers.call_structured = original
+
+
 if __name__ == "__main__":
     test_build_review_with_core_attributions()
     test_llm_deep_analysis_is_attached_without_network()
+    test_incomplete_returns_and_embedded_backtest_are_not_counted()
+    test_trade_review_aggregates_same_day_lots()
+    test_partial_money_flow_is_reported()
+    test_selection_memory_quarantines_unverified_returns()
+    test_forward_memory_backfill_reaches_beyond_display_window()
+    test_daily_forward_summary_falls_back_to_mature_d5()
     test_llm_deep_analysis_uses_minimax_structured_fallback()
+    test_llm_primary_model_uses_max_reasoning()
     print("top5_review_attribution tests passed")

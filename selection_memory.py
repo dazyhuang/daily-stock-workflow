@@ -108,11 +108,18 @@ def append_daily_selection_memory(
             "rank": idx,
             "top5_rank": top_rank.get(code),
             "signal": item.get("signal"),
+            "pm_signal": item.get("pm_signal") or item.get("llm_signal"),
+            "pm_score": item.get("pm_score") or item.get("llm_buy_score"),
+            "pm_confidence": item.get("pm_confidence") or item.get("llm_confidence"),
+            "pm_reason": item.get("pm_reason"),
+            "final_reason": item.get("final_reason") or item.get("reason"),
             "buy_score": item.get("buy_score"),
             "confidence": item.get("confidence"),
             "ranking_score": item.get("ranking_score"),
             "quant_base_score": item.get("quant_base_score"),
             "llm_risk_adjustment": item.get("llm_risk_adjustment"),
+            "historical_edge_score": item.get("historical_edge_score"),
+            "historical_weakness_penalty": item.get("historical_weakness_penalty"),
             "pool": item.get("pool"),
             "source": item.get("source"),
             "source_pools": item.get("source_pools") or [],
@@ -138,10 +145,36 @@ def append_daily_selection_memory(
     return len(new_items)
 
 
+def quarantine_unverified_selection_memory(path: Path = MEMORY_PATH) -> int:
+    items = _read_jsonl(path)
+    changed = 0
+    for item in items:
+        for horizon in ("d1", "d3", "d5", "d10"):
+            if item.get(f"return_{horizon}_complete") is True:
+                continue
+            if item.get(f"return_{horizon}_pct") is not None or item.get(f"alpha_{horizon}_pct") is not None:
+                changed += 1
+            item[f"return_{horizon}_pct"] = None
+            item[f"alpha_{horizon}_pct"] = None
+    if changed:
+        _write_jsonl(items, path)
+    return changed
+
+
 def update_selection_memory_from_top5_review(review: Dict[str, Any], path: Path = MEMORY_PATH) -> int:
     items = _read_jsonl(path)
     if not items:
         return 0
+    # Legacy reviews wrote last-available or embedded backtest values into D+N
+    # without proving that the horizon had matured.  Quarantine all such values.
+    quarantined = 0
+    for item in items:
+        for horizon in ("d1", "d3", "d5", "d10"):
+            if item.get(f"return_{horizon}_complete") is not True:
+                if item.get(f"return_{horizon}_pct") is not None or item.get(f"alpha_{horizon}_pct") is not None:
+                    quarantined += 1
+                item[f"return_{horizon}_pct"] = None
+                item[f"alpha_{horizon}_pct"] = None
     index = {(_date_key(x.get("report_date")), _stock_key(x)): x for x in items}
     updated = 0
     for review_item in review.get("items") or []:
@@ -152,12 +185,26 @@ def update_selection_memory_from_top5_review(review: Dict[str, Any], path: Path 
         if not target:
             continue
         future_returns = review_item.get("future_returns_pct") or {}
+        future_complete = review_item.get("future_return_complete") or {}
+        future_dates = review_item.get("future_return_dates") or {}
         alpha = review_item.get("alpha_pct") or {}
         for horizon in ("d1", "d3", "d5", "d10"):
-            if horizon in future_returns:
+            is_complete = future_complete.get(horizon) is True
+            target[f"return_{horizon}_complete"] = is_complete
+            target[f"return_{horizon}_date"] = future_dates.get(horizon) if is_complete else None
+            if is_complete:
                 target[f"return_{horizon}_pct"] = future_returns.get(horizon)
-            if horizon in alpha:
                 target[f"alpha_{horizon}_pct"] = alpha.get(horizon)
+            else:
+                # Clear legacy values that were written from an incomplete
+                # horizon or embedded strategy simulation.
+                target[f"return_{horizon}_pct"] = None
+                target[f"alpha_{horizon}_pct"] = None
+        target["review_price_data_quality"] = review_item.get("price_data_quality")
+        target["review_reference_source"] = review_item.get("reference_source")
+        target["review_updated_at"] = review.get("generated_at")
+        target["was_bought"] = bool(review_item.get("actual_bought"))
+        target["was_filled"] = bool(review_item.get("filled"))
         for field in (
             "primary_attribution",
             "attribution_labels",
@@ -176,6 +223,6 @@ def update_selection_memory_from_top5_review(review: Dict[str, Any], path: Path 
             if field in review_item:
                 target[field] = review_item.get(field)
         updated += 1
-    if updated:
+    if updated or quarantined:
         _write_jsonl(items, path)
     return updated

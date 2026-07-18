@@ -64,7 +64,9 @@ def configure_network_for_review() -> None:
         from domestic_network import configure_domestic_direct_network
         configure_domestic_direct_network()
     except Exception:
-        additions = ["127.0.0.1", "localhost", "127.0.0.1"]
+        bridge_url = os.getenv("XQSHARE_HTTP_BASE", "http://127.0.0.1:8080")
+        bridge_host = urllib.parse.urlparse(bridge_url).hostname
+        additions = [item for item in (bridge_host, "localhost", "127.0.0.1") if item]
         for key in ("NO_PROXY", "no_proxy"):
             existing = [p.strip() for p in os.environ.get(key, "").split(",") if p.strip()]
             seen = {p.lower() for p in existing}
@@ -79,14 +81,20 @@ load_local_env()
 configure_network_for_review()
 
 XQ_HTTP_BASE = os.getenv("XQSHARE_HTTP_BASE", "http://127.0.0.1:8080").rstrip("/")
-DEFAULT_LLM_MODEL = os.getenv("TOP5_REVIEW_LLM_MODEL", "openai/gpt-5.5")
+DEFAULT_LLM_MODEL = os.getenv("TOP5_REVIEW_LLM_MODEL", "openai/gpt-5.6-sol")
 DEFAULT_LLM_FALLBACK_MODEL = os.getenv("TOP5_REVIEW_LLM_FALLBACK_MODEL", "minimax-portal/MiniMax-M3")
+DEFAULT_LLM_REASONING_EFFORT = os.getenv("TOP5_REVIEW_LLM_REASONING_EFFORT", "max")
 DEFAULT_LLM_TIMEOUT = int(os.getenv("TOP5_REVIEW_LLM_TIMEOUT", "180"))
 DEFAULT_LLM_THINKING_BUDGET = int(os.getenv("TOP5_REVIEW_LLM_THINKING_BUDGET", "16000"))
 DEFAULT_LLM_MAX_TOKENS = int(os.getenv("TOP5_REVIEW_LLM_MAX_TOKENS", "8192"))
 DEFAULT_LLM_RETRIES = int(os.getenv("TOP5_REVIEW_LLM_RETRIES", "3"))
 ENABLE_OPENCLAW_LOCAL_FALLBACK = os.getenv("TOP5_REVIEW_ENABLE_OPENCLAW_LOCAL_FALLBACK", "").strip().lower() in {"1", "true", "yes", "on"}
 MONEY_FLOW_KEYS = ("main_net_flow", "super_net_flow", "ddx_5", "ddy_10")
+MIN_LLM_MATURE_D5_SAMPLES = int(os.getenv("TOP5_REVIEW_MIN_LLM_MATURE_D5_SAMPLES", "10"))
+_DAILY_FETCH_CACHE: Dict[str, List[Dict[str, Any]]] = {}
+_LOCAL_DAILY_CACHE: Optional[Dict[str, List[Dict[str, Any]]]] = None
+_KLINE_SOURCE_FAILURES: Counter = Counter()
+_KLINE_SOURCE_DISABLED: set[str] = set()
 
 
 if BaseModel is not None:
@@ -190,6 +198,24 @@ def _read_json(path: Path, default: Any = None) -> Any:
         return default
 
 
+def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: List[Dict[str, Any]] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return []
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(item, dict):
+            rows.append(item)
+    return rows
+
+
 def _write_json_atomic(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -208,6 +234,15 @@ def _money_flow_has_any_value(money_flow: Dict[str, Any]) -> bool:
     if not isinstance(money_flow, dict):
         return False
     return any(money_flow.get(key) is not None for key in MONEY_FLOW_KEYS)
+
+
+def _money_flow_missing_keys(money_flow: Dict[str, Any]) -> List[str]:
+    flow = money_flow if isinstance(money_flow, dict) else {}
+    return [key for key in MONEY_FLOW_KEYS if flow.get(key) is None]
+
+
+def _money_flow_is_complete(money_flow: Dict[str, Any]) -> bool:
+    return not _money_flow_missing_keys(money_flow)
 
 
 def _money_flow_backfill_cache_path(output_dir: Path, report_day: str) -> Path:
@@ -255,21 +290,25 @@ def _backfill_missing_money_flow(
 
     for pick in picks:
         money_flow = pick.get("money_flow") if isinstance(pick.get("money_flow"), dict) else {}
-        pick["money_flow_original_missing"] = not _money_flow_has_any_value(money_flow)
+        missing_keys = _money_flow_missing_keys(money_flow)
+        pick["money_flow_original_missing"] = len(missing_keys) == len(MONEY_FLOW_KEYS)
+        pick["money_flow_original_missing_keys"] = missing_keys
         pick.setdefault("money_flow_backfilled", False)
         pick.setdefault("money_flow_backfill_source", "")
         pick.setdefault("money_flow_backfill_status", "")
-        if _money_flow_has_any_value(money_flow):
+        # Historical review must never replace report-time values with today's
+        # money flow.  Backfill is diagnostic only and remains separate.
+        if not missing_keys:
             continue
 
         stock = pick.get("stock")
         cached = cache.get(stock) if isinstance(cache.get(stock), dict) else {}
         cached_flow = cached.get("money_flow") if isinstance(cached.get("money_flow"), dict) else {}
         if _money_flow_has_any_value(cached_flow):
-            pick["money_flow"] = dict(cached_flow)
             pick["money_flow_backfilled"] = True
             pick["money_flow_backfill_source"] = str(cached.get("source") or cached_flow.get("source") or "mx-data/latest_backfill_cache")
             pick["money_flow_backfill_status"] = "cache_hit"
+            pick["money_flow_backfill_snapshot"] = dict(cached_flow)
             continue
         if cached.get("status") == "empty" and empty_cache_still_fresh(cached):
             pick["money_flow_backfill_status"] = "cache_empty"
@@ -277,10 +316,10 @@ def _backfill_missing_money_flow(
 
         fetched = _fetch_money_flow_backfill_via_mx(stock)
         if _money_flow_has_any_value(fetched):
-            pick["money_flow"] = fetched
             pick["money_flow_backfilled"] = True
             pick["money_flow_backfill_source"] = str(fetched.get("source") or "mx-data/latest_backfill")
             pick["money_flow_backfill_status"] = "fetched"
+            pick["money_flow_backfill_snapshot"] = fetched
             cache[stock] = {
                 "status": "ok",
                 "source": pick["money_flow_backfill_source"],
@@ -363,18 +402,84 @@ def _parse_xq_market_data3(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def fetch_daily_ohlc(stock_code: str, count: int = 80) -> List[Dict[str, Any]]:
-    """Fetch daily OHLC from XQShare HTTP. Empty list means unavailable."""
-    try:
+    """Fetch daily OHLC through a bounded multi-source route."""
+    stock = _normalize_code(stock_code)
+    if stock in _DAILY_FETCH_CACHE:
+        return _DAILY_FETCH_CACHE[stock]
+
+    candidates: List[List[Dict[str, Any]]] = []
+
+    def keep(source: str, loader: Callable[[], Any], *, circuit_break: bool = True) -> None:
+        if source in _KLINE_SOURCE_DISABLED:
+            return
+        try:
+            rows = loader() or []
+        except Exception:
+            rows = []
+        normalized = []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict) or _safe_float(row.get("close")) is None:
+                continue
+            item = dict(row)
+            item["date"] = _normalize_date_key(item.get("date"))
+            item["source"] = str(item.get("source") or source)
+            normalized.append(item)
+        if normalized:
+            _KLINE_SOURCE_FAILURES[source] = 0
+            candidates.append(sorted(normalized, key=lambda x: x.get("date") or "")[-count:])
+        else:
+            _KLINE_SOURCE_FAILURES[source] += 1
+            if circuit_break and _KLINE_SOURCE_FAILURES[source] >= 3:
+                _KLINE_SOURCE_DISABLED.add(source)
+
+    def load_xq() -> List[Dict[str, Any]]:
         payload = _xq_http_get(
             "/market_data3",
-            {"stock": _to_xt_code(stock_code), "period": "1d", "count": count},
+            {"stock": _to_xt_code(stock), "period": "1d", "count": count},
             timeout=12,
         )
-        if payload.get("success") is False:
-            return []
-        return _parse_xq_market_data3(payload)
+        return [] if payload.get("success") is False else _parse_xq_market_data3(payload)
+
+    keep("xqshare_http", load_xq)
+    latest_reports = list_recent_report_files(OUTPUT_DIR, 1)
+    expected_latest = _report_date_from_path(latest_reports[0]) if latest_reports else ""
+    if candidates and (not expected_latest or _normalize_date_key(candidates[-1][-1].get("date")) >= expected_latest):
+        _DAILY_FETCH_CACHE[stock] = candidates[-1]
+        return candidates[-1]
+
+    cache_path = OUTPUT_DIR / "edge_rules" / "daily_ohlc_cache.json"
+    global _LOCAL_DAILY_CACHE
+    if _LOCAL_DAILY_CACHE is None:
+        try:
+            loaded = (_read_json(cache_path, {}) or {}).get("daily_ohlc", {})
+            _LOCAL_DAILY_CACHE = loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            _LOCAL_DAILY_CACHE = {}
+    cached = _LOCAL_DAILY_CACHE.get(stock, [])
+    keep("local_daily_cache", lambda: cached, circuit_break=False)
+
+    try:
+        from stock_selection_debate.data_fetcher import (
+            _fetch_kline_via_http,
+            get_kline_via_akshare,
+            get_kline_via_mx_data,
+            get_kline_via_tencent,
+        )
+        keep("qmt_http", lambda: _fetch_kline_via_http(stock, days=count))
+        keep("tencent", lambda: get_kline_via_tencent(stock, days=count))
+        keep("akshare", lambda: get_kline_via_akshare(stock, days=count))
+        if _env_flag("TOP5_REVIEW_ENABLE_MX_KLINE", False):
+            keep("mx-data", lambda: get_kline_via_mx_data(stock, days=count))
     except Exception:
-        return []
+        pass
+
+    best = max(
+        candidates,
+        key=lambda rows: (_normalize_date_key(rows[-1].get("date")) if rows else "", len(rows)),
+        default=[],
+    )
+    _DAILY_FETCH_CACHE[stock] = best
+    return best
 
 
 def fetch_minute_reference_price(stock_code: str, report_day: str) -> Optional[float]:
@@ -418,9 +523,6 @@ def _row_by_date(rows: List[Dict[str, Any]], report_day: str) -> Tuple[Optional[
     for idx, row in enumerate(rows):
         if _normalize_date_key(row.get("date")) == target:
             return idx, row
-    for idx, row in enumerate(rows):
-        if _normalize_date_key(row.get("date")) > target:
-            return idx, row
     return None, None
 
 
@@ -430,7 +532,7 @@ def _future_row(rows: List[Dict[str, Any]], start_idx: Optional[int], horizon: i
     idx = start_idx + horizon
     if idx < len(rows):
         return rows[idx]
-    return rows[-1] if rows else None
+    return None
 
 
 def calculate_price_performance(
@@ -453,7 +555,7 @@ def calculate_price_performance(
     ref_source = "minute_0931"
     if not reference_price:
         reference_price = _safe_float((day_row or {}).get("open"))
-        ref_source = "daily_open"
+        ref_source = "daily_open" if reference_price is not None else "unavailable"
         quality.append("MINUTE_0931_MISSING")
 
     open_price = _safe_float((day_row or {}).get("open"))
@@ -534,16 +636,10 @@ def _apply_embedded_price_fallback(price_perf: Dict[str, Any], pick: Dict[str, A
     returns = dict(price_perf.get("future_returns_pct") or {})
     complete = dict(price_perf.get("future_return_complete") or {})
     dates = dict(price_perf.get("future_return_dates") or {})
-    # selection_backtest/strategy_backtest is not an exact D+N series.  Store it
-    # as d5 fallback so summary/ranking remains useful but quality stays explicit.
-    returns["d5"] = fallback_ret
-    complete["d5"] = False
-    dates["d5"] = embedded.get("embedded_exit_date") or ""
+    # Strategy simulation is historical context, never realized post-selection
+    # performance.  Keep it separate and leave every D+N return unavailable.
     price_perf.update({
-        "price_data_quality": f"{price_perf.get('price_data_quality')},EMBEDDED_BACKTEST_FALLBACK",
-        "reference_price": embedded.get("embedded_reference_price"),
-        "reference_source": "embedded_backtest",
-        "same_day_close_return_pct": fallback_ret,
+        "price_data_quality": f"{price_perf.get('price_data_quality')},EMBEDDED_BACKTEST_CONTEXT_ONLY",
         "future_returns_pct": returns,
         "future_return_complete": complete,
         "future_return_dates": dates,
@@ -575,7 +671,8 @@ def _extract_top_picks(report: Dict[str, Any]) -> List[Dict[str, Any]]:
             "pool": pick.get("pool") or pick.get("source") or "未知",
             "source_pools": pick.get("source_pools") or [],
             "money_flow": pick.get("money_flow") or {},
-            "money_flow_original_missing": False,
+            "money_flow_original_missing": len(_money_flow_missing_keys(pick.get("money_flow") or {})) == len(MONEY_FLOW_KEYS),
+            "money_flow_original_missing_keys": _money_flow_missing_keys(pick.get("money_flow") or {}),
             "money_flow_backfilled": False,
             "money_flow_backfill_source": "",
             "money_flow_backfill_status": "",
@@ -650,32 +747,50 @@ def _extract_trade_info(records: List[Dict[str, Any]], stock: str, report_day: s
             "actual_source": "",
             "sell_count": 0,
         }
-    rec = sorted(matched, key=lambda r: str(r.get("updated_at") or r.get("buy_time") or r.get("buy_date") or ""))[-1]
-    buy_price = _safe_float(rec.get("buy_price"))
-    qty = _safe_int(rec.get("quantity"))
-    remaining = _safe_int(rec.get("remaining_quantity"), qty)
-    sells = rec.get("sells") if isinstance(rec.get("sells"), list) else []
+    total_qty = 0
+    total_remaining = 0
+    total_cost = 0.0
     realized_amt = 0.0
     sold_qty = 0
-    for sell in sells:
-        sell_qty = _safe_int(sell.get("quantity"))
-        sell_price = _safe_float(sell.get("price"))
-        if buy_price and sell_price and sell_qty > 0:
-            realized_amt += (sell_price - buy_price) * sell_qty
-            sold_qty += sell_qty
+    sell_count = 0
+    sources = set()
+    for rec in matched:
+        buy_price = _safe_float(rec.get("buy_price"))
+        qty = _safe_int(rec.get("quantity"))
+        remaining = _safe_int(rec.get("remaining_quantity"), qty)
+        if not buy_price or qty <= 0:
+            continue
+        total_qty += qty
+        total_remaining += max(0, remaining)
+        total_cost += buy_price * qty
+        if rec.get("source"):
+            sources.add(str(rec.get("source")))
+        sells = rec.get("sells") if isinstance(rec.get("sells"), list) else []
+        sell_count += len(sells)
+        for sell in sells:
+            sell_qty = _safe_int(sell.get("quantity"))
+            sell_price = _safe_float(sell.get("price"))
+            if sell_price and sell_qty > 0:
+                realized_amt += (sell_price - buy_price) * sell_qty
+                sold_qty += sell_qty
     unrealized_amt = 0.0
-    if buy_price and latest_close and remaining > 0:
-        unrealized_amt = (latest_close - buy_price) * remaining
-    denom = buy_price * qty if buy_price and qty > 0 else None
-    actual_return = round((realized_amt + unrealized_amt) / denom * 100.0, 2) if denom else None
+    if latest_close and total_remaining > 0 and total_qty > 0:
+        remaining_cost = sum(
+            (_safe_float(rec.get("buy_price")) or 0.0)
+            * max(0, _safe_int(rec.get("remaining_quantity"), _safe_int(rec.get("quantity"))))
+            for rec in matched
+        )
+        unrealized_amt = latest_close * total_remaining - remaining_cost
+    actual_return = round((realized_amt + unrealized_amt) / total_cost * 100.0, 2) if total_cost > 0 else None
     return {
         "actual_bought": True,
-        "actual_buy_price": buy_price,
-        "actual_quantity": qty,
-        "actual_remaining_quantity": remaining,
+        "actual_buy_price": round(total_cost / total_qty, 4) if total_qty > 0 else None,
+        "actual_quantity": total_qty,
+        "actual_remaining_quantity": total_remaining,
         "actual_return_pct_to_latest": actual_return,
-        "actual_source": rec.get("source") or "",
-        "sell_count": len(sells),
+        "actual_source": ",".join(sorted(sources)),
+        "actual_lot_count": len(matched),
+        "sell_count": sell_count,
         "sold_quantity": sold_qty,
     }
 
@@ -706,21 +821,31 @@ def _money_flow_strength(money_flow: Dict[str, Any]) -> str:
     return "neutral"
 
 
+def _complete_future_return(item: Dict[str, Any], key: str) -> Optional[float]:
+    complete = item.get("future_return_complete") or {}
+    value = (item.get("future_returns_pct") or {}).get(key)
+    return _safe_float(value) if complete.get(key) is True else None
+
+
 def _is_future_strong(item: Dict[str, Any]) -> bool:
-    fut = item.get("future_returns_pct") or {}
-    values = [fut.get("d3"), fut.get("d5"), fut.get("d10"), item.get("intraday_high_return_pct")]
+    values = [
+        _complete_future_return(item, "d3"),
+        _complete_future_return(item, "d5"),
+        _complete_future_return(item, "d10"),
+        item.get("intraday_high_return_pct") if "REPORT_DAY_OHLC_MISSING" not in str(item.get("price_data_quality") or "") else None,
+    ]
     return any(v is not None and float(v) >= 5.0 for v in values) or any(
-        fut.get(k) is not None and float(fut[k]) >= 3.0 for k in ("d5", "d10")
+        (_complete_future_return(item, k) is not None and float(_complete_future_return(item, k)) >= 3.0)
+        for k in ("d5", "d10")
     )
 
 
 def _is_future_weak(item: Dict[str, Any]) -> bool:
-    fut = item.get("future_returns_pct") or {}
-    d5 = fut.get("d5")
-    d10 = fut.get("d10")
+    d5 = _complete_future_return(item, "d5")
+    d10 = _complete_future_return(item, "d10")
     if d5 is not None and d10 is not None:
         return float(d5) <= -2.0 and float(d10) <= 0.0
-    available = [v for v in (fut.get("d3"), d5, d10) if v is not None]
+    available = [v for v in (_complete_future_return(item, "d3"), d5, d10) if v is not None]
     return bool(available) and statistics.mean(available) <= -2.0
 
 
@@ -735,9 +860,8 @@ def assign_attribution_labels(item: Dict[str, Any]) -> List[str]:
     price_quality = str(item.get("price_data_quality") or "")
     money_strength = _money_flow_strength(item.get("money_flow") or {})
 
-    has_embedded_fallback = item.get("embedded_return_pct") is not None
-    severe_price_gap = "REPORT_DAY_OHLC_MISSING" in price_quality and not has_embedded_fallback
-    if severe_price_gap or timing_missing or money_strength == "missing":
+    severe_price_gap = "REPORT_DAY_OHLC_MISSING" in price_quality
+    if severe_price_gap or timing_missing or money_strength == "missing" or item.get("money_flow_original_missing_keys"):
         labels.append("DATA_QUALITY_ISSUE")
 
     alpha_values = [v for v in alpha.values() if v is not None]
@@ -752,7 +876,11 @@ def assign_attribution_labels(item: Dict[str, Any]) -> List[str]:
 
     actual_buy = item.get("actual_buy_price") or item.get("filled_price")
     same_day_from_actual = _pct_change(actual_buy, (item.get("ohlc") or {}).get("close"))
-    d1_from_actual = fut.get("d1")
+    d1_reference_return = _complete_future_return(item, "d1")
+    d1_close = None
+    if d1_reference_return is not None and item.get("reference_price"):
+        d1_close = float(item["reference_price"]) * (1 + d1_reference_return / 100.0)
+    d1_from_actual = _pct_change(actual_buy, d1_close)
     if bought and ((same_day_from_actual is not None and same_day_from_actual <= -2.0) or (d1_from_actual is not None and d1_from_actual <= -3.0)):
         labels.append("ENTRY_TOO_LATE")
 
@@ -773,16 +901,19 @@ def assign_attribution_labels(item: Dict[str, Any]) -> List[str]:
 def data_quality_reasons(item: Dict[str, Any]) -> List[str]:
     reasons = []
     price_quality = str(item.get("price_data_quality") or "")
-    if "REPORT_DAY_OHLC_MISSING" in price_quality and item.get("embedded_return_pct") is None:
+    if "REPORT_DAY_OHLC_MISSING" in price_quality:
         reasons.append("日线行情缺失")
     if "MINUTE_0931_MISSING" in price_quality:
-        reasons.append("09:31分钟价缺失(已用日开盘价/回测价)")
+        reasons.append("09:31分钟价缺失(有日线时使用日开盘价)")
     if not item.get("timing_state_exists"):
         reasons.append("盘中状态文件缺失")
     elif not item.get("entered_watch_pool"):
         reasons.append("未进入盘中观察池")
+    missing_flow_keys = item.get("money_flow_original_missing_keys") or []
     if item.get("money_flow_strength") == "missing":
         reasons.append("资金流缺失")
+    elif missing_flow_keys:
+        reasons.append("资金流部分缺失:" + ",".join(missing_flow_keys))
     elif item.get("money_flow_original_missing") and item.get("money_flow_backfilled"):
         reasons.append("资金流由mx-data回补(非原始早报字段)")
     if item.get("quant_base_score") is None:
@@ -795,7 +926,7 @@ def data_quality_reasons(item: Dict[str, Any]) -> List[str]:
 def data_quality_issue_reasons(item: Dict[str, Any]) -> List[str]:
     reasons = []
     price_quality = str(item.get("price_data_quality") or "")
-    if "REPORT_DAY_OHLC_MISSING" in price_quality and item.get("embedded_return_pct") is None:
+    if "REPORT_DAY_OHLC_MISSING" in price_quality:
         reasons.append("日线行情缺失")
     if not item.get("timing_state_exists"):
         reasons.append("盘中状态文件缺失")
@@ -803,6 +934,8 @@ def data_quality_issue_reasons(item: Dict[str, Any]) -> List[str]:
         reasons.append("未进入盘中观察池")
     if item.get("money_flow_strength") == "missing":
         reasons.append("资金流缺失")
+    elif item.get("money_flow_original_missing_keys"):
+        reasons.append("资金流部分缺失")
     return reasons
 
 
@@ -877,9 +1010,14 @@ def _group_summary(items: List[Dict[str, Any]], group_key: str, return_key: str 
         if isinstance(raw_key, list):
             raw_key = raw_key[0] if raw_key else "未知"
         key = str(raw_key if raw_key not in (None, "") else "未知")
-        groups[key].append((item.get("future_returns_pct") or {}).get(return_key))
+        groups[key].append(_complete_future_return(item, return_key))
     return {
-        key: {"count": len(vals), "avg_return_pct": _avg(vals), "win_rate_pct": _win_rate(vals)}
+        key: {
+            "count": len(vals),
+            "mature_sample_count": sum(v is not None for v in vals),
+            "avg_return_pct": _avg(vals),
+            "win_rate_pct": _win_rate(vals),
+        }
         for key, vals in sorted(groups.items())
     }
 
@@ -929,14 +1067,26 @@ def build_summary(items: List[Dict[str, Any]], report_days: List[str]) -> Dict[s
     backfill_status = Counter(str(item.get("money_flow_backfill_status") or "not_needed") for item in items)
     summary["money_flow_backfill"] = {
         "original_missing_count": sum(1 for item in items if item.get("money_flow_original_missing")),
+        "original_partial_count": sum(
+            1
+            for item in items
+            if item.get("money_flow_original_missing_keys") and not item.get("money_flow_original_missing")
+        ),
         "backfilled_count": sum(1 for item in items if item.get("money_flow_backfilled")),
         "status_counts": dict(backfill_status.most_common()),
     }
     for horizon in REVIEW_HORIZONS:
         key = f"d{horizon}"
-        vals = [(item.get("future_returns_pct") or {}).get(key) for item in items]
-        alphas = [(item.get("alpha_pct") or {}).get(key) for item in items]
+        vals = [_complete_future_return(item, key) for item in items]
+        alphas = [
+            (item.get("alpha_pct") or {}).get(key)
+            if (item.get("future_return_complete") or {}).get(key) is True
+            else None
+            for item in items
+        ]
         summary["returns"][key] = {
+            "mature_sample_count": sum(v is not None for v in vals),
+            "immature_sample_count": len(items) - sum(v is not None for v in vals),
             "avg_return_pct": _avg(vals),
             "win_rate_pct": _win_rate(vals),
             "avg_alpha_pct": _avg(alphas),
@@ -947,8 +1097,9 @@ def build_summary(items: List[Dict[str, Any]], report_days: List[str]) -> Dict[s
         subset = [item for item in items if bool(item.get("actual_bought") or item.get("filled")) is bought_state]
         summary["bought_vs_unbought"][label] = {
             "count": len(subset),
-            "d5_avg_return_pct": _avg((item.get("future_returns_pct") or {}).get("d5") for item in subset),
-            "d10_avg_return_pct": _avg((item.get("future_returns_pct") or {}).get("d10") for item in subset),
+            "d5_mature_sample_count": sum(_complete_future_return(item, "d5") is not None for item in subset),
+            "d5_avg_return_pct": _avg(_complete_future_return(item, "d5") for item in subset),
+            "d10_avg_return_pct": _avg(_complete_future_return(item, "d10") for item in subset),
             "actual_avg_return_pct": _avg(item.get("actual_return_pct_to_latest") for item in subset),
         }
 
@@ -970,14 +1121,14 @@ def build_summary(items: List[Dict[str, Any]], report_days: List[str]) -> Dict[s
             "stock": item["stock"],
             "name": item.get("name"),
             "date": item.get("date"),
-            "d5_return_pct": (item.get("future_returns_pct") or {}).get("d5"),
-            "d10_return_pct": (item.get("future_returns_pct") or {}).get("d10"),
+            "d5_return_pct": _complete_future_return(item, "d5"),
+            "d10_return_pct": _complete_future_return(item, "d10"),
             "intraday_high_return_pct": item.get("intraday_high_return_pct"),
             "reason": item.get("not_bought_reason") or item.get("primary_attribution"),
         }
         for item in sorted(missed, key=lambda x: max(v for v in [
-            (x.get("future_returns_pct") or {}).get("d5"),
-            (x.get("future_returns_pct") or {}).get("d10"),
+            _complete_future_return(x, "d5"),
+            _complete_future_return(x, "d10"),
             x.get("intraday_high_return_pct"),
         ] if v is not None), reverse=True)[:3]
     ]
@@ -986,6 +1137,12 @@ def build_summary(items: List[Dict[str, Any]], report_days: List[str]) -> Dict[s
         item for item in items
         if any(label in item.get("attribution_labels", []) for label in ("MODEL_OVER_RISK", "QUANT_OVER_SCORE", "MONEY_FLOW_MISLEAD"))
     ]
+    mismatches.sort(
+        key=lambda item: min(
+            [v for v in (_complete_future_return(item, "d5"), _complete_future_return(item, "d10")) if v is not None]
+            or [0.0]
+        )
+    )
     summary["score_mismatch_top3"] = [
         {
             "stock": item["stock"],
@@ -995,8 +1152,8 @@ def build_summary(items: List[Dict[str, Any]], report_days: List[str]) -> Dict[s
             "quant_base_score": item.get("quant_base_score"),
             "llm_risk_adjustment": item.get("llm_risk_adjustment"),
             "money_flow_strength": item.get("money_flow_strength"),
-            "d5_return_pct": (item.get("future_returns_pct") or {}).get("d5"),
-            "d10_return_pct": (item.get("future_returns_pct") or {}).get("d10"),
+            "d5_return_pct": _complete_future_return(item, "d5"),
+            "d10_return_pct": _complete_future_return(item, "d10"),
         }
         for item in mismatches[:3]
     ]
@@ -1042,6 +1199,8 @@ def _compact_items_for_llm(items: List[Dict[str, Any]], limit: int = 50) -> List
             "d3": fut.get("d3"),
             "d5": fut.get("d5"),
             "d10": fut.get("d10"),
+            "future_return_complete": item.get("future_return_complete") or {},
+            "future_return_dates": item.get("future_return_dates") or {},
             "alpha_d5": alpha.get("d5"),
             "alpha_d10": alpha.get("d10"),
             "actual_return_pct_to_latest": item.get("actual_return_pct_to_latest"),
@@ -1052,12 +1211,19 @@ def _compact_items_for_llm(items: List[Dict[str, Any]], limit: int = 50) -> List
 
 def _build_deep_analysis_prompt(review: Dict[str, Any]) -> str:
     summary = review.get("summary") or {}
+    intraday_review = review.get("intraday_buy_review") or {}
+    try:
+        from intraday_buy_weekly_review import compact_intraday_review_for_llm
+        compact_intraday = compact_intraday_review_for_llm(intraday_review)
+    except Exception:
+        compact_intraday = {"status": "failed_to_compact"}
     payload = {
         "generated_at": review.get("generated_at"),
         "benchmark": review.get("benchmark"),
         "summary": summary,
         "per_day": review.get("per_day") or {},
         "items": _compact_items_for_llm(review.get("items") or []),
+        "intraday_buy_review": compact_intraday,
     }
     return (
         "你是A股短线/波段交易系统的复盘负责人。请基于下面的事实底稿，"
@@ -1068,6 +1234,8 @@ def _build_deep_analysis_prompt(review: Dict[str, Any]) -> str:
         "3. 如果数据质量不足，要直接指出，不要假装有完整结论。\n"
         "4. 建议必须能转化为下周可执行的规则或观察项。\n"
         "5. 输出中文，简洁但要有判断力。\n\n"
+        "6. 盘中买入复盘必须区分选股问题、技术触发问题、LLM判断问题、订单问题和进程问题；PARTIAL证据只能作为线索。\n"
+        "7. 影子策略结果只用于对照，不得建议系统自动修改实盘规则。\n\n"
         "事实底稿JSON：\n"
         f"{json.dumps(payload, ensure_ascii=False, default=str)}"
     )
@@ -1075,8 +1243,8 @@ def _build_deep_analysis_prompt(review: Dict[str, Any]) -> str:
 
 def _model_display_name(model: str) -> str:
     text = str(model or "")
-    if "gpt-5.5" in text.lower():
-        return "GPT-5.5"
+    if "gpt-5.6-sol" in text.lower():
+        return "GPT-5.6 Sol"
     if "minimax" in text.lower() or "m3" in text.lower():
         return "MiniMax-M3"
     return text or "unknown"
@@ -1131,10 +1299,11 @@ def _call_structured_deep_analysis(prompt: str, model: str, *, fallback_used: bo
         Top5ReviewDeepAnalysis,
         model=model,
         timeout=DEFAULT_LLM_TIMEOUT,
-        retries=1,
+        retries=0,
         thinking_budget=DEFAULT_LLM_THINKING_BUDGET,
         max_tokens=DEFAULT_LLM_MAX_TOKENS,
         allow_fallback=False,
+        reasoning_effort=DEFAULT_LLM_REASONING_EFFORT,
     )
     if structured is None:
         return {
@@ -1341,26 +1510,160 @@ def build_review(
         items.extend(day_items)
         per_day[_iso_date(report_day)] = {
             "top5_count": len(day_items),
-            "d5_avg_return_pct": _avg((item.get("future_returns_pct") or {}).get("d5") for item in day_items),
+            "d5_mature_sample_count": sum(_complete_future_return(item, "d5") is not None for item in day_items),
+            "d5_avg_return_pct": _avg(_complete_future_return(item, "d5") for item in day_items),
             "label_counts": dict(Counter(label for item in day_items for label in item.get("attribution_labels", []))),
         }
 
     report_days_sorted = sorted(report_days)
+    summary = build_summary(items, report_days_sorted)
     review = {
         "generated_at": datetime.now().isoformat(),
         "days_requested": days,
         "benchmark": BENCHMARK_CODE,
-        "summary": build_summary(items, report_days_sorted),
+        "summary": summary,
         "per_day": per_day,
         "items": items,
     }
-    if include_llm:
-        review["llm_deep_analysis"] = run_llm_deep_analysis(
-            review,
-            model=llm_model,
-            fallback_model=llm_fallback_model,
+    try:
+        from intraday_buy_weekly_review import build_intraday_buy_weekly_review
+        review["intraday_buy_review"] = build_intraday_buy_weekly_review(
+            output_dir=output_dir,
+            selection_items=items,
+            rolling_days=20,
         )
+    except Exception as exc:
+        review["intraday_buy_review"] = {
+            "status": "failed",
+            "error": f"{type(exc).__name__}: {exc}"[:500],
+        }
+    if include_llm:
+        mature_d5 = ((summary.get("returns") or {}).get("d5") or {}).get("mature_sample_count", 0)
+        intraday_full = int((((review.get("intraday_buy_review") or {}).get("summary") or {}).get("full_quality_count") or 0))
+        if mature_d5 < MIN_LLM_MATURE_D5_SAMPLES and intraday_full < 10:
+            review["llm_deep_analysis"] = {
+                "status": "skipped",
+                "model": "",
+                "error": (
+                    f"成熟D+5样本仅{mature_d5}只且完整盘中样本仅{intraday_full}只，"
+                    f"均不足以支持深度策略结论"
+                ),
+            }
+        else:
+            review["llm_deep_analysis"] = run_llm_deep_analysis(
+                review,
+                model=llm_model,
+                fallback_model=llm_fallback_model,
+            )
     return review
+
+
+def build_forward_memory_backfill(
+    *,
+    base_dir: Path = BASE_DIR,
+    days: int = 30,
+    horizon: str = "d10",
+    daily_fetcher: PriceFetcher = fetch_daily_ohlc,
+    minute_fetcher: MinuteFetcher = fetch_minute_reference_price,
+) -> Dict[str, Any]:
+    """Backfill mature forward returns outside the 10-day display window.
+
+    Only unresolved Top5 records are considered.  A report day is queried only
+    after the benchmark or local report calendar proves that the requested
+    horizon has matured, avoiding repeated requests for recent picks.
+    """
+    output_dir = base_dir / "output"
+    memory_path = output_dir / "selection_memory.jsonl"
+    memory_rows = _read_jsonl(memory_path)
+    pending_keys = {
+        (_normalize_date_key(item.get("report_date")), _normalize_code(item.get("stock")))
+        for item in memory_rows
+        if item.get("top5_rank")
+        and item.get(f"return_{horizon}_complete") is not True
+        and _normalize_date_key(item.get("report_date"))
+        and _normalize_code(item.get("stock"))
+    }
+    report_files = list_recent_report_files(output_dir, max(1, days))
+    all_report_days = sorted({
+        _report_date_from_path(path)
+        for path in output_dir.glob("daily_report_*.json")
+        if "daily_report_push_" not in path.name and _report_date_from_path(path)
+    })
+    horizon_steps = max(1, _safe_int(str(horizon).lower().lstrip("d"), 10))
+    trade_records = _load_trade_records(output_dir)
+    items: List[Dict[str, Any]] = []
+    eligible_days: List[str] = []
+    immature_days: List[str] = []
+    unavailable_records = 0
+    pending_in_window = 0
+
+    for path in sorted(report_files, key=_report_date_from_path):
+        report_day = _report_date_from_path(path)
+        report = _read_json(path, {}) or {}
+        picks = [
+            pick for pick in _extract_top_picks(report)
+            if (report_day, pick.get("stock")) in pending_keys
+        ]
+        if not picks:
+            continue
+        pending_in_window += len(picks)
+
+        newer_report_count = sum(1 for day in all_report_days if day > report_day)
+        benchmark_perf = calculate_price_performance(
+            BENCHMARK_CODE,
+            report_day,
+            daily_fetcher=daily_fetcher,
+            minute_fetcher=lambda _code, _day: None,
+        )
+        benchmark_complete = (benchmark_perf.get("future_return_complete") or {}).get(horizon) is True
+        if newer_report_count < horizon_steps and not benchmark_complete:
+            immature_days.append(report_day)
+            continue
+
+        eligible_days.append(report_day)
+        benchmark_returns = benchmark_perf.get("future_returns_pct") or {}
+        timing_state = _load_timing_state(output_dir, report_day)
+        for pick in picks:
+            item = _build_pick_review(
+                pick,
+                report_day,
+                timing_state,
+                trade_records,
+                benchmark_returns,
+                daily_fetcher=daily_fetcher,
+                minute_fetcher=minute_fetcher,
+            )
+            if (item.get("future_return_complete") or {}).get(horizon) is True:
+                items.append(item)
+            else:
+                unavailable_records += 1
+
+    completed = sum(
+        1 for item in items
+        if (item.get("future_return_complete") or {}).get(horizon) is True
+    )
+    if completed:
+        status = "ok"
+    elif pending_in_window:
+        status = "no_mature_pending_samples"
+    else:
+        status = "no_pending_records"
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "items": items,
+        "summary": {
+            "status": status,
+            "horizon": horizon,
+            "days_requested": max(1, days),
+            "report_days_scanned": len(report_files),
+            "pending_records_in_window": pending_in_window,
+            "eligible_report_days": [_iso_date(day) for day in sorted(set(eligible_days))],
+            "immature_report_days": [_iso_date(day) for day in sorted(set(immature_days))],
+            "records_calculated": len(items),
+            "completed_records": completed,
+            "unavailable_records": unavailable_records,
+        },
+    }
 
 
 def format_feishu_text(review: Dict[str, Any]) -> str:
@@ -1383,19 +1686,34 @@ def format_feishu_text(review: Dict[str, Any]) -> str:
     missed = summary.get("opportunity_missed_top3") or []
     mismatch = summary.get("score_mismatch_top3") or []
 
+    mature_d5 = int(d5.get("mature_sample_count") or 0)
+    title = "📊" if mature_d5 >= MIN_LLM_MATURE_D5_SAMPLES else "⚠️"
     lines = [
-        f"📊 最近{summary.get('days_count', 0)}个交易日Top5复盘归因",
-        f"样本: {summary.get('top5_count', 0)}只 | D+5均值 {d5.get('avg_return_pct')}% | D+10均值 {d10.get('avg_return_pct')}%",
+        f"{title} 最近{summary.get('days_count', 0)}个交易日Top5复盘归因",
+        f"样本: {summary.get('top5_count', 0)}只 | 成熟D+5 {mature_d5}只 | 成熟D+10 {d10.get('mature_sample_count', 0)}只",
+        f"D+5均值 {d5.get('avg_return_pct')}% | D+10均值 {d10.get('avg_return_pct')}%",
         f"D+5胜率 {d5.get('win_rate_pct')}% | 跑赢沪深300 {d5.get('beat_benchmark_rate_pct')}%",
         f"主要问题: {top_labels}",
     ]
+    if mature_d5 < MIN_LLM_MATURE_D5_SAMPLES:
+        lines.insert(1, f"复盘数据不足：成熟D+5样本低于{MIN_LLM_MATURE_D5_SAMPLES}只，本次不生成策略结论、不写入未成熟收益。")
     if top_issue_quality:
         lines.append(f"触发数据问题: {top_issue_quality}")
     if backfill:
         lines.append(
             "资金流回补: "
             f"原始缺失{backfill.get('original_missing_count', 0)}只，"
-            f"mx-data补回{backfill.get('backfilled_count', 0)}只"
+            f"部分缺失{backfill.get('original_partial_count', 0)}只，"
+            f"mx-data诊断快照{backfill.get('backfilled_count', 0)}只(不替代历史值)"
+        )
+    forward_backfill = review.get("forward_memory_backfill") or {}
+    if forward_backfill:
+        lines.append(
+            "前向样本回填: "
+            f"扫描{forward_backfill.get('report_days_scanned', 0)}个报告日，"
+            f"补齐{str(forward_backfill.get('horizon') or 'd10').upper()} "
+            f"{forward_backfill.get('completed_records', 0)}条，"
+            f"写入记忆{forward_backfill.get('records_updated', 0)}条"
         )
     if gap_hints:
         lines.append("缺口修复Top3: " + "；".join(
@@ -1414,10 +1732,19 @@ def format_feishu_text(review: Dict[str, Any]) -> str:
             f"{x['stock']} {x.get('name','')} {','.join(x.get('labels') or [])}"
             for x in mismatch[:3]
         ))
+    intraday_review = review.get("intraday_buy_review") or {}
+    try:
+        from intraday_buy_weekly_review import format_intraday_review_text
+        lines.append("")
+        lines.append(format_intraday_review_text(intraday_review))
+    except Exception as exc:
+        lines.append(f"盘中买入复盘生成失败: {type(exc).__name__}: {exc}")
     llm = review.get("llm_deep_analysis") or {}
     if llm:
         if llm.get("status") == "ok":
             lines.append(f"🤖 LLM深度解读({llm.get('model')}): {llm.get('overall_conclusion')}")
+            if llm.get("execution_diagnosis"):
+                lines.append(f"盘中执行诊断: {llm.get('execution_diagnosis')}")
             causes = llm.get("root_causes") or []
             if causes:
                 lines.append("核心归因: " + "；".join(str(x) for x in causes[:3]))
@@ -1472,7 +1799,11 @@ def push_feishu_text(text: str, webhook: Optional[str] = None) -> bool:
     return ok
 
 
-def save_review(review: Dict[str, Any], output_dir: Path = OUTPUT_DIR) -> Tuple[Path, Path]:
+def save_review(
+    review: Dict[str, Any],
+    output_dir: Path = OUTPUT_DIR,
+    memory_backfill_review: Optional[Dict[str, Any]] = None,
+) -> Tuple[Path, Path]:
     today_key = date.today().strftime("%Y%m%d")
     dated = output_dir / f"top5_review_{today_key}.json"
     latest = output_dir / "top5_review_latest.json"
@@ -1480,14 +1811,33 @@ def save_review(review: Dict[str, Any], output_dir: Path = OUTPUT_DIR) -> Tuple[
     _write_json_atomic(latest, review)
     try:
         from selection_memory import update_selection_memory_from_top5_review
-        updated = update_selection_memory_from_top5_review(review)
+        memory_path = output_dir / "selection_memory.jsonl"
+        updated = update_selection_memory_from_top5_review(review, path=memory_path)
         review.setdefault("selection_memory", {})["records_updated"] = updated
+        backfill_updated = 0
+        if memory_backfill_review:
+            backfill_updated = update_selection_memory_from_top5_review(
+                memory_backfill_review,
+                path=memory_path,
+            )
+            forward_summary = review.setdefault("forward_memory_backfill", {})
+            forward_summary["records_updated"] = backfill_updated
+        review.setdefault("selection_memory", {})["forward_records_updated"] = backfill_updated
+        review.setdefault("selection_memory", {})["total_records_updated"] = updated + backfill_updated
         _write_json_atomic(dated, review)
         _write_json_atomic(latest, review)
     except Exception as exc:
         review.setdefault("selection_memory", {})["update_error"] = str(exc)[:300]
         _write_json_atomic(dated, review)
         _write_json_atomic(latest, review)
+    try:
+        from intraday_buy_weekly_review import update_intraday_policy_memory
+        updated = update_intraday_policy_memory(review.get("intraday_buy_review") or {}, output_dir)
+        review.setdefault("intraday_buy_review", {}).setdefault("policy_memory", {})["records_updated"] = updated
+    except Exception as exc:
+        review.setdefault("intraday_buy_review", {}).setdefault("policy_memory", {})["update_error"] = str(exc)[:300]
+    _write_json_atomic(dated, review)
+    _write_json_atomic(latest, review)
     return dated, latest
 
 
@@ -1497,12 +1847,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--push", action="store_true", help="推送简洁飞书文本")
     parser.add_argument("--no-save", action="store_true", help="只打印摘要，不写output文件")
     parser.add_argument("--no-llm", action="store_true", help="禁用LLM深度解读，只做规则归因")
-    parser.add_argument("--llm-model", default=DEFAULT_LLM_MODEL, help="深度解读主模型，默认GPT-5.5")
+    parser.add_argument("--llm-model", default=DEFAULT_LLM_MODEL, help="深度解读主模型，默认GPT-5.6 Sol")
     parser.add_argument("--llm-fallback-model", default=DEFAULT_LLM_FALLBACK_MODEL, help="深度解读兜底模型，默认MiniMax M3")
     parser.add_argument("--no-edge-rules", action="store_true", help="不生成全候选池历史优势组合规则")
     parser.add_argument("--edge-days", type=int, default=20, help="生成weekly优势规则时读取最近N个daily_report")
     parser.add_argument("--edge-min-samples", type=int, default=25, help="优势规则最小样本数")
     parser.add_argument("--edge-min-days", type=int, default=8, help="优势规则最少覆盖交易日数")
+    parser.add_argument("--forward-backfill-days", type=int, default=30, help="额外扫描最近N个报告日，补齐已成熟D+10前向样本；0=禁用")
     args = parser.parse_args(argv)
 
     start = time.time()
@@ -1512,10 +1863,35 @@ def main(argv: Optional[List[str]] = None) -> int:
         llm_model=args.llm_model,
         llm_fallback_model=args.llm_fallback_model,
     )
+    exit_reasons: List[str] = []
+    memory_backfill_review: Optional[Dict[str, Any]] = None
+    if not args.no_save and args.forward_backfill_days > 0:
+        try:
+            memory_backfill_review = build_forward_memory_backfill(
+                days=max(args.days + 1, args.forward_backfill_days),
+            )
+            review["forward_memory_backfill"] = dict(memory_backfill_review.get("summary") or {})
+        except Exception as exc:
+            review["forward_memory_backfill"] = {
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {exc}"[:500],
+            }
+            exit_reasons.append(f"forward_backfill_failed:{type(exc).__name__}")
+    intraday_status = str((review.get("intraday_buy_review") or {}).get("status") or "missing")
+    if intraday_status in {"failed", "missing", "no_data"}:
+        intraday_error = str((review.get("intraday_buy_review") or {}).get("error") or intraday_status)
+        exit_reasons.append(f"intraday_buy_review_{intraday_status}:{intraday_error[:120]}")
+    mature_d5 = int((((review.get("summary") or {}).get("returns") or {}).get("d5") or {}).get("mature_sample_count") or 0)
+    if mature_d5 < MIN_LLM_MATURE_D5_SAMPLES:
+        exit_reasons.append(f"mature_d5_samples={mature_d5}<{MIN_LLM_MATURE_D5_SAMPLES}")
     edge_text = ""
     if not args.no_edge_rules:
         try:
-            from candidate_edge_rules import build_and_save_edge_rules, format_edge_rules_text
+            from candidate_edge_rules import (
+                build_and_save_edge_rules,
+                build_scoring_shadow_replay,
+                format_edge_rules_text,
+            )
             edge_result = build_and_save_edge_rules(
                 days=args.edge_days,
                 mode="both",
@@ -1529,15 +1905,46 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "price_summary": payload.get("price_summary", {}),
                     "baseline": payload.get("baseline", {}),
                     "top_rules": (payload.get("rules") or [])[:5],
+                    "negative_rules": (payload.get("negative_rules") or [])[:5],
+                    "chase_policy": payload.get("chase_policy", {}),
                 }
                 for mode, payload in edge_result.items()
             }
+            try:
+                review["scoring_shadow_replay"] = build_scoring_shadow_replay(
+                    output_dir=OUTPUT_DIR,
+                    start_date="20260601",
+                )
+            except Exception as shadow_exc:
+                review["scoring_shadow_replay"] = {
+                    "status": "failed",
+                    "error": f"{type(shadow_exc).__name__}: {shadow_exc}"[:500],
+                }
+                exit_reasons.append(f"shadow_replay_failed:{type(shadow_exc).__name__}")
             edge_text = format_edge_rules_text(edge_result)
+            shadow = review.get("scoring_shadow_replay") or {}
+            if shadow.get("old") and shadow.get("new"):
+                old_metrics = shadow.get("old") or {}
+                new_metrics = shadow.get("new") or {}
+                shadow_lines = ["影子回放（2026-06起，全候选池，逐日无未来数据）"]
+                for horizon in (1, 3, 5):
+                    shadow_lines.append(
+                        f"D+{horizon}: 旧均收益{old_metrics.get(f'd{horizon}_avg_return_pct')}%/"
+                        f"胜率{old_metrics.get(f'd{horizon}_win_rate_pct')}% -> "
+                        f"新均收益{new_metrics.get(f'd{horizon}_avg_return_pct')}%/"
+                        f"胜率{new_metrics.get(f'd{horizon}_win_rate_pct')}%"
+                    )
+                shadow_lines.append(
+                    f"高追涨占比: {old_metrics.get('high_chase_ratio_pct')}% -> "
+                    f"{new_metrics.get('high_chase_ratio_pct')}%"
+                )
+                edge_text = edge_text + "\n" + "\n".join(shadow_lines)
         except Exception as exc:
             review["candidate_edge_rules"] = {"status": "failed", "error": str(exc)[:500]}
             edge_text = f"📊 全候选池历史优势组合复盘失败: {str(exc)[:200]}"
+            exit_reasons.append(f"edge_rules_failed:{type(exc).__name__}")
     if not args.no_save:
-        dated, latest = save_review(review)
+        dated, latest = save_review(review, memory_backfill_review=memory_backfill_review)
         print(f"saved: {dated}")
         print(f"saved: {latest}")
     text = format_feishu_text(review)
@@ -1547,7 +1954,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.push:
         ok, reason = push_feishu_text_detailed(text)
         print(f"feishu_push={'ok' if ok else 'failed'} reason={reason}")
+        if not ok:
+            exit_reasons.append(f"feishu_push_failed:{reason[:120]}")
+    llm = review.get("llm_deep_analysis") or {}
+    if not args.no_llm and llm.get("status") != "ok":
+        exit_reasons.append(f"llm_{llm.get('status') or 'missing'}:{str(llm.get('error') or '')[:120]}")
     print(f"elapsed={time.time() - start:.1f}s")
+    if exit_reasons:
+        print("task_status=failed reasons=" + " | ".join(exit_reasons))
+        return 2
+    print("task_status=ok")
     return 0
 
 

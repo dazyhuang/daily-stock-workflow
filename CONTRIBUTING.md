@@ -29,12 +29,18 @@ environment.
 - Do not commit `.env`, logs, runtime reports, account exports, or broker data.
 - Keep changes scoped to the issue or feature being addressed.
 - Update README or docs when behavior changes.
+- Update `VERSION`, `CHANGELOG.md`, and release notes when preparing a release.
 - Add or update tests when changing fallback logic, scoring, execution helpers,
   or file formats.
-- Run at least a syntax check before opening a PR:
+- Run the focused public checks before opening a PR:
 
 ```bash
 python3 -m compileall -q .
+python3 test_market_snapshot_router.py
+python3 test_knowledge_rules.py
+python3 test_candidate_edge_rules.py
+python3 test_workflow_refactor_contracts.py
+python3 test_selection_correctness_v3.py
 ```
 
 ## Reporting Issues

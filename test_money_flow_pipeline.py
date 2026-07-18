@@ -148,8 +148,10 @@ def test_eastmoney_direct_parse_and_aggregate():
         flow = df._fetch_money_flow_via_eastmoney_direct("000001")
         assert round(flow["main_net_flow"], 2) == 0.02
         assert round(flow["super_net_flow"], 3) == 0.008
-        assert round(flow["ddx_5"], 2) == 0.07
-        assert round(flow["ddy_10"], 2) == 0.07
+        assert round(flow["main_net_flow_5d"], 2) == 0.07
+        assert round(flow["main_net_flow_10d"], 2) == 0.07
+        assert flow["source"] == "eastmoney"
+        assert flow["as_of"] == "20260528"
     finally:
         df.retry_call = old_retry
 
@@ -318,8 +320,10 @@ def test_qmt_money_flow_disabled_by_default():
     # 后续由 mx/eastmoney/ak/rank 字段级补全。
     assert not hasattr(df, "_fetch_money_flow_batch_via_qmt_http")
     merged = df._merge_money_flow({}, {})
-    assert set(merged) == {"main_net_flow", "super_net_flow", "ddx_5", "ddy_10"}
-    assert all(value is None for value in merged.values())
+    for key in ("main_net_flow", "super_net_flow", "ddx_5", "ddy_10", "main_net_flow_5d", "main_net_flow_10d"):
+        assert merged[key] is None
+    assert merged["source"] == "none"
+    assert merged["field_sources"] == {}
 
 
 def test_mx_money_flow_empty_response_is_safe():
@@ -602,6 +606,52 @@ def test_mx_money_flow_daily_quota_circuit_breaker():
             os.environ["MX_MONEY_FLOW_RATE_LIMIT_COOLDOWN_SEC"] = old_cooldown
 
 
+def test_mx_money_flow_auth_error_is_explicit():
+    import sys
+    import types
+    import stock_selection_debate.data_fetcher as df
+
+    old_module = sys.modules.get("mx_data")
+    old_streak = df._MX_MONEY_FLOW_FAIL_STREAK
+    old_until = df._MX_MONEY_FLOW_DISABLED_UNTIL
+    old_last_query = df._MX_MONEY_FLOW_LAST_QUERY_AT
+    old_interval = os.environ.get("MX_MONEY_FLOW_QUERY_INTERVAL_SEC")
+    try:
+        class FakeMXData:
+            def __init__(self, *_a, **_k):
+                pass
+
+            def query(self, query):
+                return {"query": query}
+
+            def parse_result(self, _result):
+                return [], [], 0, "顶层错误: 状态码 114 - API密钥不存在或已失效"
+
+        sys.modules["mx_data"] = types.SimpleNamespace(MXData=FakeMXData)
+        os.environ["MX_MONEY_FLOW_QUERY_INTERVAL_SEC"] = "0"
+        df._MX_MONEY_FLOW_FAIL_STREAK = 0
+        df._MX_MONEY_FLOW_DISABLED_UNTIL = 0.0
+        df._MX_MONEY_FLOW_LAST_QUERY_AT = 0.0
+
+        flow = df._fetch_money_flow_via_mx("600000")
+        assert flow["status"] == "auth_error"
+        assert flow["source"] == "mx-data"
+        assert flow["diagnostics"]["auth_error"] is True
+        assert "114" in flow["error"]
+    finally:
+        if old_module is None:
+            sys.modules.pop("mx_data", None)
+        else:
+            sys.modules["mx_data"] = old_module
+        df._MX_MONEY_FLOW_FAIL_STREAK = old_streak
+        df._MX_MONEY_FLOW_DISABLED_UNTIL = old_until
+        df._MX_MONEY_FLOW_LAST_QUERY_AT = old_last_query
+        if old_interval is None:
+            os.environ.pop("MX_MONEY_FLOW_QUERY_INTERVAL_SEC", None)
+        else:
+            os.environ["MX_MONEY_FLOW_QUERY_INTERVAL_SEC"] = old_interval
+
+
 def test_prefetch_can_disable_live_money_flow_sources():
     import stock_selection_debate.data_fetcher as df
 
@@ -734,6 +784,7 @@ def main():
     test_mx_money_flow_rate_limit_does_not_circuit_break()
     test_mx_money_flow_112_retries_then_success()
     test_mx_money_flow_daily_quota_circuit_breaker()
+    test_mx_money_flow_auth_error_is_explicit()
     test_prefetch_can_disable_live_money_flow_sources()
     test_prefetch_default_uses_mx_money_flow_source()
     print("money-flow pipeline tests passed")

@@ -1,8 +1,21 @@
 # 每日选股工作流
 
+[English README](README.md)
+
+当前版本：**v0.2.0** · [更新日志](CHANGELOG.md) · [版本说明](docs/releases/v0.2.0.md)
+
 一个面向 A 股研究的实验性选股工作流，覆盖市场信息收集、候选池构建、LLM 多因子评分、回测验证、盘中执行辅助和周度复盘。
 
 这是经过清理的公开版本。仓库不包含真实运行报告、日志、账户状态、券商导出文件、API Key、Webhook 地址或本机路径。
+
+## v0.2.0 主要更新
+
+- 新增带版本的数据路由契约，记录数据来源、新鲜度、降级链路和缺失状态。
+- 新增可验证行情快照，统一输出均线、RSI、MACD、KDJ、ATR、量能和价格位置等事实。
+- 新增知识规则与历史边际规则，评分调整保留规则来源和证据字段。
+- 工作流支持按候选池、筛选签名、评分版本和辩论节点进行断点恢复。
+- 新增统一模型路由，可通过环境变量配置主模型和两级降级模型。
+- 盘中决策事件与周度执行归因可追踪，便于复盘买入时机和未成交原因。
 
 ## 工作流
 
@@ -97,8 +110,23 @@ python3 top5_review_attribution.py --days 10
 
 - `DRY_RUN=1`：推荐的首次运行模式。
 - `MX_APIKEY`、`MINIMAX_API_KEY`、`MX_DIRECT_KEY`、`VOLCAN_API_KEY`、`VOLCAN_ENGINE_API_KEY`：按你启用的模型和数据链路配置。
+- `OPENAI_API_KEY`：使用 OpenAI API 路由时配置。
+- `STOCK_SELECTION_DEFAULT_MODEL`、`STOCK_SELECTION_FALLBACK_MODEL`、`STOCK_SELECTION_SECONDARY_FALLBACK_MODEL`：配置主模型和降级顺序。
 - `FEISHU_WEBHOOK_URL`：配置后启用飞书通知推送。
 - `QMT_HTTP_URL`、`XQSHARE_HTTP_BASE`：指向你的本地行情/交易桥接服务。公开默认值使用 `127.0.0.1` 占位。
+
+## 离线核心检查
+
+```bash
+python3 -m compileall -q .
+python3 test_market_snapshot_router.py
+python3 test_knowledge_rules.py
+python3 test_candidate_edge_rules.py
+python3 test_workflow_refactor_contracts.py
+python3 test_selection_correctness_v3.py
+```
+
+发布改动前建议运行这些检查。依赖实时行情、模型服务或本地桥接的测试，应在具备相应服务的环境中单独运行。
 
 ## 运行产物
 
@@ -109,6 +137,8 @@ python3 top5_review_attribution.py --days 10
 - `runtime_archive/`
 - `knowledge-base/*.json`
 - `weekly_strategy/checkpoints/*.json`
+
+仓库版本号保存在 `VERSION`，面向使用者的变化记录在 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 开源前清理范围
 

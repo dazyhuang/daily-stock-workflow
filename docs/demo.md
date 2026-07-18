@@ -22,6 +22,13 @@ python3 workflow.py
 Expected output files are written under `output/` when the configured data
 providers are available. `output/` is intentionally ignored by Git.
 
+In v0.2.0, inspect these fields in candidate and report artifacts:
+
+- `data_contract` and `data_router_summary` for source, freshness, and fallback status.
+- `market_snapshot` for deterministic technical evidence.
+- `knowledge_rule_hits` and scoring version fields for traceable score adjustments.
+- `artifacts` for pointers to detailed candidate and trace files kept out of the compact report.
+
 ## 3. Inspect Money-Flow Quality
 
 ```bash
@@ -41,7 +48,17 @@ This summarizes recent Top5 candidates and classifies attribution patterns.
 Provider failures should be treated separately from model or workflow logic
 failures.
 
-## 5. Optional Intraday Helpers
+## 5. Run Offline Checks
+
+```bash
+python3 test_market_snapshot_router.py
+python3 test_knowledge_rules.py
+python3 test_candidate_edge_rules.py
+python3 test_workflow_refactor_contracts.py
+python3 test_selection_correctness_v3.py
+```
+
+## 6. Optional Intraday Helpers
 
 ```bash
 python3 intraday_executor.py --mode=status
@@ -57,9 +74,10 @@ your own private broker bridge.
 ```mermaid
 flowchart TD
     A[Collect context] --> B[Build candidates]
-    B --> C[LLM score and debate]
-    C --> D[Backtest]
-    D --> E[Daily report]
-    E --> F[Dry-run intraday helper]
-    F --> G[Weekly review]
+    B --> C[Attach data contracts and verified snapshot]
+    C --> D[LLM score and debate]
+    D --> E[Backtest and causal checks]
+    E --> F[Compact daily report and detailed artifacts]
+    F --> G[Dry-run intraday helper]
+    G --> H[Weekly review and attribution]
 ```

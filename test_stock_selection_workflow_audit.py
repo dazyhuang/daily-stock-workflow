@@ -98,6 +98,7 @@ def model_routing_checks():
         role_budget_ok = (
             calls[-1].get("thinking_budget") == providers.THINKING_BUDGET_VOLCAN
             and calls[-1].get("fallback_thinking_budget") == providers.THINKING_BUDGET_MINIMAX
+            and calls[-1].get("max_tokens") == providers.ROLE_MAX_TOKENS
             and providers.THINKING_BUDGET_MINIMAX > 0
         )
         record("辩论角色 thinking 设置", role_budget_ok, f"实际传参={calls[-1]}")
@@ -125,27 +126,52 @@ def model_routing_checks():
         providers._PROVIDER_MAP = old_map
         builtins.open = old_open
 
-    record("火山 thinking 预算为 high 档", providers.THINKING_BUDGET_VOLCAN == 16000 and providers.THINKING_BUDGET_MINIMAX == 8000, f"volc={providers.THINKING_BUDGET_VOLCAN} minimax={providers.THINKING_BUDGET_MINIMAX}")
+    thinking = providers._thinking_payload(
+        providers.ROLE_MAX_TOKENS,
+        providers.THINKING_BUDGET_VOLCAN,
+        "volcengine-plan",
+    )
+    final_output_reserve = providers.ROLE_MAX_TOKENS - int((thinking or {}).get("budget_tokens") or 0)
+    record(
+        "火山节点使用 high 思考并保留正文空间",
+        providers.ROLE_MAX_TOKENS == 12288
+        and providers.THINKING_BUDGET_VOLCAN == 8192
+        and providers.THINKING_BUDGET_MINIMAX == 8000
+        and thinking == {"type": "enabled", "budget_tokens": 8192}
+        and final_output_reserve == 4096,
+        f"max={providers.ROLE_MAX_TOKENS} thinking={thinking} reserve={final_output_reserve}",
+    )
 
 
 def generation_config_checks():
     providers = importlib.import_module("stock_selection_debate.providers")
     debate_engine = importlib.import_module("stock_selection_debate.debate_engine")
 
+    record(
+        "所有GPT-5.6 Sol调用统一强制max",
+        providers._reasoning_effort_for_model("openai/gpt-5.6-sol", "high") == "max"
+        and providers._reasoning_effort_for_model("openai/gpt-5.6-sol", "xhigh") == "max",
+    )
+
     prompt = debate_engine.PORTFOLIO_MANAGER_PROMPT
     no_fence = "```" not in prompt
     record("PM prompt 不含 markdown JSON fence", no_fence, f"fence_count={prompt.count('```')}")
     record(
-        "PM MiniMax 兜底后不再继续切火山",
-        debate_engine.PORTFOLIO_MANAGER_SECONDARY_MODEL == "minimax-portal/MiniMax-M3"
+        "PM 模型级联为 Sol max -> Sol max -> MiniMax",
+        debate_engine.PORTFOLIO_MANAGER_PRIMARY_MODEL == "openai/gpt-5.6-sol"
+        and debate_engine.PORTFOLIO_MANAGER_PRIMARY_REASONING_EFFORT == "max"
+        and debate_engine.PORTFOLIO_MANAGER_SECONDARY_MODEL == "openai/gpt-5.6-sol"
+        and debate_engine.PORTFOLIO_MANAGER_SECONDARY_REASONING_EFFORT == "max"
+        and debate_engine.PORTFOLIO_MANAGER_TERTIARY_MODEL == "minimax-portal/MiniMax-M3"
         and debate_engine.PORTFOLIO_MANAGER_SECONDARY_FALLBACK_MODEL == "",
-        f"secondary={debate_engine.PORTFOLIO_MANAGER_SECONDARY_MODEL} fallback={debate_engine.PORTFOLIO_MANAGER_SECONDARY_FALLBACK_MODEL!r}",
+        f"primary={debate_engine.PORTFOLIO_MANAGER_PRIMARY_MODEL} effort={debate_engine.PORTFOLIO_MANAGER_PRIMARY_REASONING_EFFORT} "
+        f"secondary={debate_engine.PORTFOLIO_MANAGER_SECONDARY_MODEL} tertiary={debate_engine.PORTFOLIO_MANAGER_TERTIARY_MODEL}",
     )
     record(
         "PM MiniMax 兜底优先 structured JSON 且保留 thinking预算",
-        debate_engine._is_minimax_model(debate_engine.PORTFOLIO_MANAGER_SECONDARY_MODEL)
+        debate_engine._is_minimax_model(debate_engine.PORTFOLIO_MANAGER_TERTIARY_MODEL)
         and debate_engine.PORTFOLIO_MANAGER_MINIMAX_BUDGET > 0,
-        f"secondary={debate_engine.PORTFOLIO_MANAGER_SECONDARY_MODEL} budget={debate_engine.PORTFOLIO_MANAGER_MINIMAX_BUDGET}",
+        f"tertiary={debate_engine.PORTFOLIO_MANAGER_TERTIARY_MODEL} budget={debate_engine.PORTFOLIO_MANAGER_MINIMAX_BUDGET}",
     )
 
     captured = []
@@ -182,14 +208,27 @@ def generation_config_checks():
         providers._get_api_key = lambda provider: "x" * 32
         providers._call_structured_volcengine("prompt", providers.PortfolioManagerOutput, 1, 15000, 1500)
         providers._call_structured_minimax("prompt", providers.PortfolioManagerOutput, 1, 15000, 1500)
+        providers._call_structured_openai_responses(
+            "openai/gpt-5.6-sol",
+            "prompt",
+            providers.PortfolioManagerOutput,
+            1,
+            1500,
+            reasoning_effort="xhigh",
+        )
     finally:
         providers.urllib.request.urlopen = old_urlopen
         providers._get_api_key = old_get_key
 
-    volc, minimax = captured
+    volc, minimax, sol = captured
     record("火山 structured 使用 response_format", volc.get("response_format") == {"type": "json_object"}, str(volc.get("response_format")))
     record("structured 低温输出", volc.get("temperature") == 0 and minimax.get("temperature") == 0, f"volc={volc.get('temperature')} minimax={minimax.get('temperature')}")
     record("structured 禁用 thinking 参数", "thinking" not in volc and "thinking" not in minimax, f"volc={volc.get('thinking')} minimax={minimax.get('thinking')}")
+    record(
+        "GPT-5.6 Sol structured 强制使用 max",
+        sol.get("model") == "gpt-5.6-sol" and (sol.get("reasoning") or {}).get("effort") == "max",
+        f"model={sol.get('model')} reasoning={sol.get('reasoning')}",
+    )
 
 
 def portfolio_output_checks():
@@ -202,9 +241,11 @@ def portfolio_output_checks():
     try:
         providers.call_structured = lambda *a, **k: providers.PortfolioManagerOutput(
             signal="BUY",
+            buy_score=76,
             confidence=76,
             position_ratio=0.25,
             reason="结构化输出测试通过",
+            evidence_refs=[{"field": "indicators.rsi_14", "value": "55", "claim": "RSI处于中性区"}],
         )
         providers.call_llm = lambda *a, **k: ""
         state = {
@@ -213,6 +254,10 @@ def portfolio_output_checks():
             "history": "风险讨论",
             "signal": "WATCH",
             "confidence": 50,
+            "debate_packet": {
+                "indicators": {"rsi_14": 55},
+                "data_contract": {"kline": {"status": "ok"}},
+            },
         }
         out = debate_engine.portfolio_manager_node(state)
         has_ratio = "position_ratio" in out
@@ -248,11 +293,12 @@ def portfolio_output_checks():
                 "buy_score": 63,
                 "confidence": 63,
                 "position_ratio": 0.15,
-                "reason": "GPT-5.5空结构化结果修复成功。",
+                "reason": "GPT-5.6 Sol空结构化结果修复成功。",
+                "evidence_refs": [{"field": "indicators.rsi_14", "value": "55", "claim": "RSI处于中性区"}],
             }
 
         providers._call_structured_openai_responses = fake_openai_structured
-        debate_engine._pm_gpt55_broken = False
+        debate_engine._pm_primary_broken = False
         debate_engine._secondary_broken = False
         structured, source = debate_engine._call_portfolio_manager_structured(
             "原始基金经理事实材料",
@@ -261,15 +307,15 @@ def portfolio_output_checks():
             "测试股份",
         )
         repair_ok = (
-            source == "Structured:GPT-5.5Repair"
+            source == "Structured:GPT-5.6-SolRepair"
             and structured.signal == "WATCH"
             and len(openai_calls) == 4
             and "没有返回可解析 JSON" in openai_calls[-1]
         )
-        record("PM GPT-5.5空结构化结果可自修复一次", repair_ok, f"source={source} calls={len(openai_calls)}")
+        record("PM GPT-5.6 Sol空结构化结果可自修复一次", repair_ok, f"source={source} calls={len(openai_calls)}")
     finally:
         providers._call_structured_openai_responses = original_openai_structured
-        debate_engine._pm_gpt55_broken = False
+        debate_engine._pm_primary_broken = False
         debate_engine._secondary_broken = False
 
     original_structured = providers.call_structured
@@ -278,9 +324,11 @@ def portfolio_output_checks():
         def repair_call(*args, **kwargs):
             return providers.PortfolioManagerOutput(
                 signal="WATCH",
+                buy_score=66,
                 confidence=66,
                 position_ratio=0.2,
                 reason="纯文本裁决修复成功",
+                evidence_refs=[{"field": "indicators.rsi_14", "value": "55", "claim": "RSI处于中性区"}],
             )
 
         text_calls = []
@@ -297,10 +345,14 @@ def portfolio_output_checks():
             "history": "风险讨论",
             "signal": "WATCH",
             "confidence": 50,
+            "debate_packet": {
+                "indicators": {"rsi_14": 55},
+                "data_contract": {"kline": {"status": "ok"}},
+            },
         }
         out = debate_engine.portfolio_manager_node(state)
         structured_ok = (
-            out.get("decision_source") == "Structured:minimax-portal/MiniMax-M3"
+            out.get("decision_source") == "Structured:MiniMax-M3"
             and out.get("position_ratio") == 0.2
             and not text_calls
         )
@@ -327,14 +379,17 @@ def portfolio_output_checks():
             "signal": "WATCH",
             "confidence": 50,
         }
-        out = debate_engine.portfolio_manager_node(state)
+        raised_for_retry = False
+        try:
+            debate_engine.portfolio_manager_node(state)
+        except debate_engine.RoleEvidenceValidationError:
+            raised_for_retry = True
         thinking_budget = text_calls[-1][1].get("thinking_budget") if text_calls else None
         text_ok = (
-            out.get("decision_source") == "MiniMaxThinkingText"
-            and out.get("position_ratio") == 0.2
+            raised_for_retry
             and thinking_budget == debate_engine.PORTFOLIO_MANAGER_MINIMAX_BUDGET
         )
-        record("PM structured失败后MiniMax thinking文本仍可解析", text_ok, f"source={out.get('decision_source')} ratio={out.get('position_ratio')} thinking_budget={thinking_budget}")
+        record("PM thinking文本缺少证据时标记待重试", text_ok, f"raised={raised_for_retry} thinking_budget={thinking_budget}")
     finally:
         providers.call_structured = original_structured
         providers.call_llm = original_llm
@@ -351,9 +406,12 @@ def portfolio_output_checks():
             "signal": "WATCH",
             "confidence": 50,
         }
-        out = debate_engine.portfolio_manager_node(state)
-        ok = out.get("decision_source") == "TextOnly" and out.get("position_ratio") == 0.0 and out.get("confidence") == 0
-        record("修复失败转 TextOnly 且仓位为0", ok, f"source={out.get('decision_source')} conf={out.get('confidence')} ratio={out.get('position_ratio')}")
+        raised_for_retry = False
+        try:
+            debate_engine.portfolio_manager_node(state)
+        except debate_engine.RoleEvidenceValidationError:
+            raised_for_retry = True
+        record("修复失败且无证据时标记待重试", raised_for_retry, f"raised={raised_for_retry}")
     finally:
         providers.call_structured = original_structured
         providers.call_llm = original_llm
@@ -460,7 +518,10 @@ def candidate_source_checks():
     safe_name = llm_scorer._xuangu_safe_filename(startup["query"])
     record(
         "mx-xuangu CSV 文件名映射保留筛选来源",
-        " " not in safe_name and "准备启动" not in safe_name and safe_name.startswith("A股_5日均线") and "20日均线" in safe_name,
+        " " not in safe_name
+        and "准备启动" not in safe_name
+        and safe_name.startswith("A股_非ST_上个交易日5日均线")
+        and "20日均线" in safe_name,
         safe_name,
     )
     record(
@@ -468,8 +529,9 @@ def candidate_source_checks():
         startup.get("strategy_type") == "capital_absorption_dip"
         and capital.get("strategy_type") == "startup_dip"
         and "5日均线" in startup.get("query", "")
-        and "10日主力资金净流入" in startup.get("query", "")
-        and "成交量放量" in startup.get("query", ""),
+        and "上上上个交易日主力净额合计" in startup.get("query", "")
+        and "量比1.2到2.5" in startup.get("query", "")
+        and "20个交易日前" in startup.get("query", ""),
         f"startup={startup}; capital={capital}",
     )
 
@@ -518,7 +580,8 @@ def candidate_source_checks():
         len(merged) == 2
         and first.get("source_pools") == ["准备启动", "资金异动"]
         and set(first.get("strategy_types", [])) == {"startup_dip", "capital_absorption_dip"}
-        and "低吸" in "；".join(first.get("entry_biases", []))
+        and "均线压缩" in "；".join(first.get("entry_biases", []))
+        and "不追高" in "；".join(first.get("entry_biases", []))
     )
     record("第一阶段同股候选合并并保留全部来源", merge_ok, str(first))
 
@@ -592,11 +655,12 @@ def candidate_source_checks():
     top = phase2["top_picks"][0]
     source_keep_ok = (
         top.get("source_pools") == ["准备启动", "资金异动"]
-        and "低吸" in top.get("entry_bias", "")
+        and "均线压缩" in top.get("entry_bias", "")
+        and "不追高" in "；".join(top.get("entry_biases", []))
         and top.get("pool_score") == 88.8
         and top.get("pool_rank") == 1
     )
-    record("phase2 top_picks 保留筛选来源、池内分和低吸偏好", source_keep_ok, str(top))
+    record("phase2 top_picks 保留筛选来源、池内分和入场偏好", source_keep_ok, str(top))
 
     prompt = intraday._build_buy_timing_prompt(
         top,
@@ -1250,21 +1314,21 @@ def intraday_buy_timing_checks():
                 "\n".join([
                     "INTRADAY_LLM_MODEL=volcengine-plan/ark-code-latest",
                     "INTRADAY_BUY_TIMING_LLM_MODEL=minimax-portal/MiniMax-M3",
-                    "INTRADAY_BUY_TIMING_LLM_FALLBACK_MODEL=openai-codex/gpt-5.5",
+                    "INTRADAY_BUY_TIMING_LLM_FALLBACK_MODEL=openai/gpt-5.6-sol",
                 ]),
                 encoding="utf-8",
             )
             explicit_models = health._effective_intraday_buy_models(health._load_env_file_values())
             model_env_ok = (
                 default_models["primary"] == ("minimax-portal/MiniMax-M3", "default")
-                and default_models["fallback"] == ("openai-codex/gpt-5.5", "default")
+                and default_models["fallback"] == ("openai/gpt-5.6-sol", "default")
                 and inherited_models["primary"] == ("volcengine-plan/ark-code-latest", ".env")
                 and inherited_models["fallback"] == ("minimax-portal/MiniMax-M3", ".env")
                 and explicit_models["primary"] == ("minimax-portal/MiniMax-M3", ".env")
-                and explicit_models["fallback"] == ("openai-codex/gpt-5.5", ".env")
+                and explicit_models["fallback"] == ("openai/gpt-5.6-sol", ".env")
             )
             record(
-                "分时买入健康检查按有效模型配置识别MiniMax主用和GPT5.5兜底",
+                "分时买入健康检查按有效模型配置识别MiniMax主用和GPT-5.6 Sol兜底",
                 model_env_ok,
                 f"default={default_models} inherited={inherited_models} explicit={explicit_models}",
             )
@@ -1272,10 +1336,24 @@ def intraday_buy_timing_checks():
         health.BASE_DIR = original_health_base
 
     test_signal = {"stock": "000001", "name": "平安银行", "signal": "BUY", "confidence": 80, "position_ratio": "20%"}
+    opening_day = datetime(2026, 5, 19).date()
+    prev_day = opening_day - timedelta(days=1)
+    prev_tail_bars = [
+        {
+            "time": datetime.combine(prev_day, dt_time(13, 30)) + timedelta(minutes=i),
+            "open": 9.9,
+            "high": 9.95,
+            "low": 9.85,
+            "close": 9.9,
+            "volume": 1000,
+        }
+        for i in range(120)
+    ]
+    opening_bar_0931 = {"time": datetime(2026, 5, 19, 9, 31), "open": 10.0, "high": 10.25, "low": 9.98, "close": 10.2}
     opening_decision = intraday._technical_buy_timing_decision(
         test_signal,
         {"price": 10.2, "open": 10.0, "high": 10.25, "low": 9.98},
-        [{"time": datetime(2026, 5, 19, 9, 31), "open": 10.0, "high": 10.25, "low": 9.98, "close": 10.2}],
+        prev_tail_bars + [opening_bar_0931],
         {"decisions": []},
         datetime(2026, 5, 19, 9, 31, 20),
     )
@@ -1287,14 +1365,14 @@ def intraday_buy_timing_checks():
     opening_retry_decision = intraday._technical_buy_timing_decision(
         test_signal,
         {"price": 10.2, "open": 10.0, "high": 10.25, "low": 9.98},
-        [{"time": datetime(2026, 5, 19, 9, 32), "open": 10.0, "high": 10.25, "low": 9.98, "close": 10.2}],
+        prev_tail_bars + [{"time": datetime(2026, 5, 19, 9, 32), "open": 10.0, "high": 10.25, "low": 9.98, "close": 10.2}],
         opening_retry_entry,
         datetime(2026, 5, 19, 9, 32, 0),
     )
     opening_retry_consumed = intraday._technical_buy_timing_decision(
         test_signal,
-        {"price": 10.2, "open": 10.0, "high": 10.25, "low": 9.98},
-        [{"time": datetime(2026, 5, 19, 9, 33), "open": 10.0, "high": 10.25, "low": 9.98, "close": 10.2}],
+        {"price": 9.9, "open": 10.0, "high": 10.25, "low": 9.88},
+        prev_tail_bars + [{"time": datetime(2026, 5, 19, 9, 33), "open": 10.0, "high": 10.25, "low": 9.88, "close": 9.9}],
         opening_retry_entry,
         datetime(2026, 5, 19, 9, 33, 0),
     )
@@ -1306,12 +1384,28 @@ def intraday_buy_timing_checks():
         opening_incomplete_entry,
         datetime(2026, 5, 19, 9, 31, 30),
     )
+    opening_no_today_entry = {"status": "open"}
+    opening_no_today_decision = intraday._technical_buy_timing_decision(
+        test_signal,
+        {"price": 10.2, "open": 10.0, "high": 10.25, "low": 9.98},
+        prev_tail_bars,
+        opening_no_today_entry,
+        datetime(2026, 5, 19, 9, 31, 30),
+    )
+    opening_no_prev_entry = {"status": "open"}
+    opening_no_prev_decision = intraday._technical_buy_timing_decision(
+        test_signal,
+        {"price": 10.2, "open": 10.0, "high": 10.25, "low": 9.98},
+        [opening_bar_0931],
+        opening_no_prev_entry,
+        datetime(2026, 5, 19, 9, 31, 30),
+    )
     ma120_bars = [
-        {"time": datetime.combine(date.today(), datetime.min.time()).replace(hour=9, minute=30), "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0}
+        {"time": datetime.combine(opening_day, datetime.min.time()).replace(hour=9, minute=30), "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0}
         for _ in range(119)
     ] + [
-        {"time": datetime.combine(date.today(), datetime.min.time()).replace(hour=11, minute=29), "open": 9.9, "high": 9.95, "low": 9.85, "close": 9.9},
-        {"time": datetime.combine(date.today(), datetime.min.time()).replace(hour=13, minute=0), "open": 9.95, "high": 10.25, "low": 9.95, "close": 10.2},
+        {"time": datetime.combine(opening_day, datetime.min.time()).replace(hour=11, minute=29), "open": 9.9, "high": 9.95, "low": 9.85, "close": 9.9},
+        {"time": datetime.combine(opening_day, datetime.min.time()).replace(hour=13, minute=0), "open": 9.95, "high": 10.25, "low": 9.95, "close": 10.2},
     ]
     ma120_decision = intraday._technical_buy_timing_decision(
         test_signal,
@@ -1327,6 +1421,10 @@ def intraday_buy_timing_checks():
         and opening_retry_consumed is None
         and opening_incomplete_decision is None
         and "opening_chase_evaluated_at" not in opening_incomplete_entry
+        and opening_no_today_decision is None
+        and "opening_chase_evaluated_at" not in opening_no_today_entry
+        and opening_no_prev_decision is None
+        and "opening_chase_evaluated_at" not in opening_no_prev_entry
         and ma120_decision and ma120_decision.get("technical_trigger") == "MA120_CROSS_UP"
         and ma120_decision.get("force_llm_review")
     )
@@ -2343,10 +2441,10 @@ def feishu_daily_card_checks():
         for elem in card.get("elements", [])
         if elem.get("tag") == "div"
     )
-    record("飞书早报过滤0仓位WATCH和K线偏短后展示观察Top", "今日无BUY，展示观察Top1" in content and "000001" not in content and "000002" not in content and "000004" in content, content[:300])
+    record("飞书早报不再按仓位过滤WATCH且仍过滤K线偏短", "今日无BUY，展示观察Top2" in content and "000001" in content and "000002" not in content and "000004" in content, content[:300])
     record("飞书早报不把缺失指数伪装为0涨跌", "指数涨跌: 暂无数据" in content and "上证 +0.00%" not in content, content[:300])
     record("飞书早报从新闻提取强弱板块", "强势板块: 电子、计算机" in content and "弱势板块: 有色金属、大消费、医药" in content, content[:500])
-    record("飞书早报拆分关键数据缺口", "关键缺口1/4: K线偏短1" in content, content[-300:])
+    record("飞书早报拆分关键数据缺口", "核心缺口: K线偏短 1只" in content, content[-500:])
     record("飞书早报完整展示长理由", "但主方向应保持观望" in content and "短期投机机会，但主方向" in content, content)
 
 
@@ -2386,7 +2484,11 @@ def data_quality_summary_checks():
             {"stock": "000005", "signal": "AVOID", "confidence": 100, "position_ratio": "0%"},
         ]
     })
-    record("phase2 top_picks 只保留可买BUY和正仓位WATCH", [s.get("stock") for s in phase2.get("top_picks", [])] == ["000002", "000004"], str(phase2.get("top_picks", [])))
+    record(
+        "phase2 top_picks 不再用早报仓位过滤WATCH",
+        [s.get("stock") for s in phase2.get("top_picks", [])] == ["000002", "000003", "000004"],
+        str(phase2.get("top_picks", [])),
+    )
 
 
 def market_news_format_checks():

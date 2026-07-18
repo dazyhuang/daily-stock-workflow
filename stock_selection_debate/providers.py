@@ -6,16 +6,16 @@
 支持两种 API 格式：
 - anthropic-messages (MiniMax M3)
 - openai-completions / openai-chat (volcengine ark-code)
-- openai-codex-responses (GPT-5.5)
+- openai-codex-responses (GPT-5.6 Sol)
 
 用法：
     from providers import call_llm, call_llm_structured
 
     # 简单调用
-    text = call_llm("prompt", model="openai/gpt-5.5")
+    text = call_llm("prompt", model="openai/gpt-5.6-sol")
 
     # Structured output（返回 Pydantic 模型）
-    result = call_llm_structured("prompt", model="openai/gpt-5.5",
+    result = call_llm_structured("prompt", model="openai/gpt-5.6-sol",
                                  schema=MySchema)
 """
 
@@ -32,15 +32,19 @@ from pathlib import Path
 _volcan_circuit_broken: bool = False
 _volcan_circuit_day: str = ""
 _volcan_circuit_lock = __import__("threading").Lock()
+_volcan_request_lock = threading.Lock()
+_volcan_last_request_at = 0.0
 from typing import Optional, Type, TypeVar, Any
 import urllib.request
 import urllib.error
 import socket
 from pydantic import BaseModel, Field, field_validator
+from model_router import resolve_model_route
 
-logger = logging.getLogger("providers")
+logger = logging.getLogger("daily_stock_workflow.providers")
 
 _ENV_LOADED = False
+_CONFIG_LOAD_LOCK = threading.RLock()
 
 
 def _load_project_env() -> None:
@@ -48,24 +52,27 @@ def _load_project_env() -> None:
     global _ENV_LOADED
     if _ENV_LOADED:
         return
-    _ENV_LOADED = True
-    env_files = [
-        Path.home() / ".openclaw" / ".env",
-        Path(__file__).resolve().parents[1] / ".env",
-    ]
-    for env_file in env_files:
-        if not env_file.exists():
-            continue
-        try:
-            for line in env_file.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                os.environ.setdefault(key, value.strip().strip("\"'"))
-        except Exception as exc:
-            logger.warning(f"[providers] .env 读取失败 {env_file}: {exc}")
-    os.environ.setdefault("MINIMAX_ALLOW_MX_DIRECT_KEY", "1")
+    with _CONFIG_LOAD_LOCK:
+        if _ENV_LOADED:
+            return
+        env_files = [
+            Path.home() / ".openclaw" / ".env",
+            Path(__file__).resolve().parents[1] / ".env",
+        ]
+        for env_file in env_files:
+            if not env_file.exists():
+                continue
+            try:
+                for line in env_file.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    os.environ.setdefault(key, value.strip().strip("\"'"))
+            except Exception as exc:
+                logger.warning(f"[providers] .env 读取失败 {env_file}: {exc}")
+        os.environ.setdefault("MINIMAX_ALLOW_MX_DIRECT_KEY", "1")
+        _ENV_LOADED = True
 
 
 def _today_key() -> str:
@@ -91,6 +98,23 @@ def _trip_volcan_circuit() -> None:
         _volcan_circuit_broken = True
         _volcan_circuit_day = _today_key()
 
+
+def _wait_for_volcan_request_slot() -> None:
+    """Space request starts without reducing the three-stock debate parallelism."""
+    global _volcan_last_request_at
+    try:
+        interval = max(0.0, float(os.getenv("VOLCAN_REQUEST_INTERVAL_SEC", "1.0")))
+    except (TypeError, ValueError):
+        interval = 1.0
+    if interval <= 0:
+        return
+    with _volcan_request_lock:
+        now = time.monotonic()
+        wait = interval - (now - _volcan_last_request_at)
+        if wait > 0:
+            time.sleep(wait)
+        _volcan_last_request_at = time.monotonic()
+
 # ── 全局配置（延迟加载）────────────────────────────────────
 _PROVIDER_MAP: dict = {}
 _MODEL_PROVIDER_MAP: dict = {
@@ -101,7 +125,7 @@ _MODEL_PROVIDER_MAP: dict = {
     "MiniMax-M3": "minimax-portal",
     "MiniMax-M2": "minimax-portal",
     # Codex/OpenAI-compatible bundled models
-    "gpt-5.5": "openai-codex",
+    "gpt-5.6-sol": "openai-codex",
     "gpt-5.4-mini": "openai-codex",
     "gpt-5.2": "openai-codex",
 }
@@ -115,6 +139,25 @@ LLM_ERROR_TRANSIENT_NETWORK = "TRANSIENT_NETWORK"
 LLM_ERROR_EMPTY_OUTPUT = "EMPTY_OUTPUT"
 LLM_ERROR_PARSE = "PARSE_ERROR"
 LLM_ERROR_UNKNOWN = "UNKNOWN"
+
+
+LLM_RETRY_POLICY_VERSION = "2026-07-09.node-retry-v1"
+
+
+def effective_llm_retries(node_name: str = "default", default: int = 3) -> int:
+    """Node-level retry budget, inspired by TradingAgents llm_max_retries."""
+    aliases = [
+        f"LLM_MAX_RETRIES_{str(node_name or 'default').upper().replace('-', '_')}",
+        "LLM_MAX_RETRIES",
+    ]
+    for key in aliases:
+        raw = os.getenv(key)
+        if raw not in (None, ""):
+            try:
+                return max(1, int(raw))
+            except Exception:
+                pass
+    return max(1, int(default or 1))
 
 
 def classify_llm_error(exc: Exception | None) -> str:
@@ -200,6 +243,14 @@ def _split_model_ref(model: str) -> tuple[str, str]:
     if provider_name in {"openai", "codex"}:
         provider_name = "openai-codex"
     return provider_name, model_name
+
+
+def _reasoning_effort_for_model(model: str, requested: str = "high") -> str:
+    """GPT-5.6 Sol always runs at the user-selected maximum reasoning level."""
+    _provider_name, model_name = _split_model_ref(str(model or ""))
+    if model_name.lower() == "gpt-5.6-sol":
+        return "max"
+    return str(requested or "high")
 
 
 def _schema_for_json_schema(schema: Type[BaseModel]) -> dict:
@@ -383,38 +434,42 @@ def _load_models_config() -> None:
     _load_project_env()
     if _PROVIDER_MAP:
         return
+    with _CONFIG_LOAD_LOCK:
+        if _PROVIDER_MAP:
+            return
+        loaded: dict = {}
+        try:
+            cfg_path = Path.home() / ".openclaw" / "agents" / "main" / "agent" / "models.json"
+            with open(cfg_path) as f:
+                models = json.load(f)
+            for provider, info in models.get("providers", {}).items():
+                api = info.get("api", "")
+                base_url = info.get("baseUrl", "") or info.get("base_url", "")
+                api_key = info.get("apiKey", "") or info.get("key", "") or ""
+                if base_url and api:
+                    loaded[provider] = {
+                        "api": api,
+                        "baseUrl": base_url.rstrip("/"),
+                        "apiKey": api_key,
+                    }
+        except Exception as e:
+            logger.warning(f"[providers] models.json 读取失败: {e}")
 
-    try:
-        cfg_path = Path.home() / ".openclaw" / "agents" / "main" / "agent" / "models.json"
-        with open(cfg_path) as f:
-            models = json.load(f)
-        for provider, info in models.get("providers", {}).items():
-            api = info.get("api", "")
-            base_url = info.get("baseUrl", "") or info.get("base_url", "")
-            api_key = info.get("apiKey", "") or info.get("key", "") or ""
-            if base_url and api:
-                _PROVIDER_MAP[provider] = {
-                    "api": api,
-                    "baseUrl": base_url.rstrip("/"),
-                    "apiKey": api_key,
-                }
-    except Exception as e:
-        logger.warning(f"[providers] models.json 读取失败: {e}")
-
-    legacy_defaults = {
-        "volcengine-plan": {
-            "api": "openai-completions",
-            "baseUrl": "https://ark.cn-beijing.volces.com/api/coding/v3",
-            "apiKey": "",
-        },
-        "minimax-portal": {
-            "api": "anthropic-messages",
-            "baseUrl": "https://api.minimaxi.com/anthropic/v1",
-            "apiKey": "",
-        },
-    }
-    for provider, cfg in legacy_defaults.items():
-        _PROVIDER_MAP.setdefault(provider, cfg)
+        legacy_defaults = {
+            "volcengine-plan": {
+                "api": "openai-completions",
+                "baseUrl": "https://ark.cn-beijing.volces.com/api/coding/v3",
+                "apiKey": "",
+            },
+            "minimax-portal": {
+                "api": "anthropic-messages",
+                "baseUrl": "https://api.minimaxi.com/anthropic/v1",
+                "apiKey": "",
+            },
+        }
+        for provider, cfg in legacy_defaults.items():
+            loaded.setdefault(provider, cfg)
+        _PROVIDER_MAP = loaded
 
 
 def _get_api_key(provider_name: str) -> str:
@@ -439,8 +494,6 @@ def _get_api_key(provider_name: str) -> str:
             elif provider_name in {"openai-codex", "codex", "openai"}:
                 profile_keys = (
                     "openai-codex:default",
-                    "openai-codex:dazyhuang@icloud.com",
-                    "openai:dazyhuang@icloud.com",
                     "openai:default",
                     "codex:default",
                 )
@@ -451,17 +504,6 @@ def _get_api_key(provider_name: str) -> str:
                 key = entry.get("key") or entry.get("access", "")
                 if key and len(key) > 20:
                     return key
-        except Exception:
-            pass
-
-    if provider_name in {"openai-codex", "codex", "openai"}:
-        try:
-            codex_auth_path = Path.home() / ".codex" / "auth.json"
-            with open(codex_auth_path) as cf:
-                codex_auth = json.load(cf)
-            token = ((codex_auth.get("tokens") or {}).get("access_token") or "").strip()
-            if token and len(token) > 20:
-                return token
         except Exception:
             pass
 
@@ -478,6 +520,8 @@ def _get_api_key(provider_name: str) -> str:
             api_key = os.environ.get("MINIMAX_API_KEY") or os.environ.get("MINIMAX_NATIVE_KEY", "")
             if not api_key and os.environ.get("MINIMAX_ALLOW_MX_DIRECT_KEY") == "1":
                 api_key = os.environ.get("MX_DIRECT_KEY", "")
+        elif provider_name in {"openai-codex", "codex", "openai"}:
+            api_key = os.environ.get("OPENAI_API_KEY", "")
     return api_key
 
 
@@ -508,7 +552,7 @@ def _call_minimax_portal_cli(
         cmd.extend(["--thinking", thinking])
     cmd.extend(["--message", message])
     env = os.environ.copy()
-    env.setdefault("OPENCLAW_WORKSPACE", "./workspace")
+    env.setdefault("OPENCLAW_WORKSPACE", ".")
     proc = subprocess.run(
         cmd,
         cwd=str(Path(__file__).resolve().parents[1]),
@@ -534,7 +578,7 @@ def _call_minimax_portal_cli(
 def call_llm(
     prompt: str,
     system: str = "",
-    model: str = "openai/gpt-5.5",
+    model: str = "openai/gpt-5.6-sol",
     timeout: int = 120,
     retries: int = 3,
     max_tokens: int = 12000,
@@ -574,6 +618,8 @@ def call_llm(
             # 熔断检查：volcengine 当日已熔断后，全局后续请求直接切 MiniMax
             if provider_name == "volcengine-plan" and _is_volcan_circuit_open():
                 raise urllib.error.HTTPError(None, 429, "Circuit Open", {}, None)
+            if provider_name == "volcengine-plan":
+                _wait_for_volcan_request_slot()
 
             if provider_name == "openai-codex" and api_type == "openai-codex-responses":
                 api_key = _get_api_key(provider_name)
@@ -593,7 +639,10 @@ def call_llm(
                     "store": False,
                     "instructions": system or "You are a precise financial analysis assistant.",
                     "input": [{"role": "user", "content": prompt}],
-                    "reasoning": {"context": "current_turn", "effort": "high"},
+                    "reasoning": {
+                        "context": "current_turn",
+                        "effort": _reasoning_effort_for_model(model, "high"),
+                    },
                 }
                 req = urllib.request.Request(
                     url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
@@ -744,7 +793,7 @@ def call_llm(
                 if think_blob:
                     return think_blob
 
-            # 429 → backoff
+            last_err = RuntimeError(f"{model} returned empty output")
             if attempt < retries - 1:
                 time.sleep(30 * (2 ** attempt))
 
@@ -778,8 +827,7 @@ def call_llm(
             err_str = str(e).lower()
             is_conn_err = any(x in err_str for x in ["connection refused", "connection abort", "timed out", "timeout", "reset by peer"])
             if is_conn_err and provider_name == "volcengine-plan" and attempt >= retries - 1:
-                logger.warning(f"[providers] volcengine 连接失败({type(e).__name__})且重试耗尽，熔断切 MiniMax")
-                _trip_volcan_circuit()
+                logger.warning(f"[providers] volcengine 连接失败({type(e).__name__})且重试耗尽；按瞬时网络错误处理，不触发全局熔断")
             if attempt < retries - 1:
                 time.sleep(10 * (attempt + 1))
 
@@ -806,6 +854,10 @@ class PortfolioManagerOutput(BaseModel):
     buy_score: Optional[int] = Field(default=None, ge=0, le=100, description="未来1-3个交易日短线做多吸引力评分 0-100，会参与最终综合排序但不是唯一排序依据")
     confidence: int = Field(ge=0, le=100, description="对 signal 与 buy_score 可靠程度的置信度 0-100")
     position_ratio: float = Field(ge=0.0, le=1.0, description="建议仓位比例")
+    allow_direct_buy: Optional[bool] = Field(default=None, description="是否允许早报信号进入直接买入口径；若需要盘中确认则为 false")
+    needs_intraday_confirmation: Optional[bool] = Field(default=None, description="是否必须等盘中技术/量能/承接确认后才允许买入")
+    entry_condition: Optional[str] = Field(default="", description="盘中买入应等待的具体条件；可直接买入时写'开盘强势/盘中强势可买'等简短条件")
+    block_buy_reason: Optional[str] = Field(default="", description="不能直接BUY的核心阻断理由；没有则为空字符串")
     reason: str = Field(description="核心理由，2-3句话")
     evidence_refs: list[EvidenceRef] = Field(default_factory=list, description="支撑 reason 的证据引用；每条必须来自数据包真实字段")
     missing_data_used: list[MissingDataCategory] = Field(default_factory=list, description="只能填写数据合同中的缺失大类: kline, money_flow, financial, sector, news；没有则为空数组")
@@ -850,13 +902,14 @@ def call_structured(
     prompt: str,
     schema: Type[BaseModel],
     system: str = "",
-    model: str = "openai/gpt-5.5",
+    model: str = "openai/gpt-5.6-sol",
     timeout: int = 120,
     retries: int = 3,
     thinking_budget: int = 50000,
     max_tokens: int = 1500,
     allow_fallback: bool = True,
     fallback_model: str = "",
+    reasoning_effort: str = "max",
 ) -> Optional[BaseModel]:
     """
     强制 LLM 输出纯 JSON 并解析为 Pydantic 模型。
@@ -896,9 +949,11 @@ def call_structured(
     if fallback == primary:
         fallback = ""
 
+    retries = effective_llm_retries("structured", retries)
     last_err = None
     tried_fallback = False
-    for attempt in range(retries + 1):  # +1 to allow fallback attempt
+    attempt_count = retries + 1 if allow_fallback and fallback else retries
+    for attempt in range(attempt_count):
         try:
             provider_name, _model_name = _split_model_ref(model)
             # 熔断检查：volcengine 当日触发过 429 后，直接切 MiniMax
@@ -916,7 +971,14 @@ def call_structured(
             cfg = _PROVIDER_MAP.get(provider_name, {})
             api_type = cfg.get("api", "")
             if provider_name == "openai-codex":
-                data = _call_structured_openai_responses(model, json_only_prompt, schema, timeout, max_tokens)
+                data = _call_structured_openai_responses(
+                    model,
+                    json_only_prompt,
+                    schema,
+                    timeout,
+                    max_tokens,
+                    reasoning_effort=reasoning_effort,
+                )
             elif provider_name == "minimax-portal":
                 text = _call_minimax_portal_cli(
                     prompt=json_only_prompt,
@@ -947,7 +1009,7 @@ def call_structured(
             if "volcengine" in model and err_class == LLM_ERROR_AUTH:
                 logger.warning("[call_structured] volcengine 认证/配置失败，立即熔断本次任务主模型")
                 _trip_volcan_circuit()
-            elif isinstance(e, urllib.error.HTTPError) and e.code == 429 and "volcengine" in model:
+            elif isinstance(e, urllib.error.HTTPError) and e.code == 429 and "volcengine" in model and attempt >= retries - 1:
                 _trip_volcan_circuit()
             logger.warning(f"[call_structured] {model} attempt {attempt+1} failed: {e}")
 
@@ -1062,6 +1124,7 @@ def _call_structured_openai_responses(
     schema: Type[BaseModel],
     timeout: int,
     max_tokens: int,
+    reasoning_effort: str = "max",
 ) -> Optional[dict]:
     """OpenAI/Codex Responses structured output via json_schema."""
     _load_models_config()
@@ -1090,7 +1153,10 @@ def _call_structured_openai_responses(
         "store": False,
         "instructions": "You are a portfolio manager. Output ONLY valid JSON matching the schema exactly. No extra text.",
         "input": [{"role": "user", "content": prompt}],
-        "reasoning": {"context": "current_turn", "effort": "high"},
+        "reasoning": {
+            "context": "current_turn",
+            "effort": _reasoning_effort_for_model(model, reasoning_effort),
+        },
         "text": {
             "format": {
                 "type": "json_schema",
@@ -1179,14 +1245,14 @@ def call_llm_structured(
     prompt: str,
     schema: Type[T],
     system: str = "",
-    model: str = "openai/gpt-5.5",
+    model: str = "openai/gpt-5.6-sol",
     timeout: int = 120,
     retries: int = 3,
     thinking_budget: int = 50000,
 ) -> Optional[T]:
     """
     使用统一 structured output 返回 Pydantic 模型。
-    默认 GPT-5.5，失败时由 call_structured 路径切 MiniMax。
+    默认 GPT-5.6 Sol，失败时由 call_structured 路径切 MiniMax。
     """
 
     return call_structured(
@@ -1275,7 +1341,7 @@ def call_llm_structured(
 if __name__ == "__main__":
     # 简单测试
     print("测试 providers.py...")
-    r = call_llm("1+1=?", model="openai/gpt-5.5", max_tokens=10, thinking_budget=16384)
+    r = call_llm("1+1=?", model="openai/gpt-5.6-sol", max_tokens=10, thinking_budget=16384)
     print(f"结果: {r[:100]}")
 
 
@@ -1285,7 +1351,7 @@ DEFAULT_MODEL = os.environ.get(
 )
 FALLBACK_MODEL = os.environ.get(
     "TA_FALLBACK_MODEL",
-    "openai/gpt-5.5",
+    "openai/gpt-5.6-sol",
 )
 SECONDARY_FALLBACK_MODEL = os.environ.get(
     "TA_SECONDARY_FALLBACK_MODEL",
@@ -1293,7 +1359,8 @@ SECONDARY_FALLBACK_MODEL = os.environ.get(
 )
 MAX_DEBATE_ROUNDS = int(os.environ.get("TA_MAX_DEBATE_ROUNDS", "2"))  # 6-04 老板拍板：多空各 2 轮（原来是 1）
 DEFAULT_TIMEOUT = int(os.environ.get("TA_TIMEOUT", "120"))
-THINKING_BUDGET_VOLCAN = int(os.environ.get("TA_THINKING_BUDGET_VOLCAN", "16000"))
+ROLE_MAX_TOKENS = int(os.environ.get("TA_ROLE_MAX_TOKENS", "12288"))
+THINKING_BUDGET_VOLCAN = int(os.environ.get("TA_THINKING_BUDGET_VOLCAN", "8192"))
 THINKING_BUDGET_MINIMAX = int(os.environ.get("TA_THINKING_BUDGET_MINIMAX", "8000"))
 
 # MiniMax 兜底并发控制：限制最多同时 3 个兜底请求，避免雪崩
@@ -1318,6 +1385,7 @@ def call_llm_with_fallback(
     temperature: float = 0.3,
     max_tokens: int = 12000,
     actual_model_out: Optional[list] = None,
+    node_name: str = "default",
 ) -> str:
     """主模型失败后自动切换备用，model/fallback_model 为空则用默认值。
 
@@ -1325,11 +1393,11 @@ def call_llm_with_fallback(
     模型名（primary 或 fallback）写入 actual_model_out[0]，用于早报卡片
     显示真实跑的是哪个模型。仅当返回值非空时写入。
     """
-    primary = model or DEFAULT_MODEL
-    fallback = fallback_model or FALLBACK_MODEL
-    secondary = secondary_fallback_model or SECONDARY_FALLBACK_MODEL
-    if secondary == primary or secondary == fallback:
-        secondary = ""
+    retries = effective_llm_retries(node_name, retries)
+    route = resolve_model_route(model or DEFAULT_MODEL, fallback_model or FALLBACK_MODEL, secondary_fallback_model or SECONDARY_FALLBACK_MODEL)
+    primary = route.primary
+    fallback = route.fallback
+    secondary = route.secondary
     if primary.startswith("volcengine-plan/") and _is_volcan_circuit_open():
         logger.info(f"主模型 {primary} 当日已熔断，直接使用备用 {fallback}")
         result = call_llm(prompt=prompt, system=system, model=fallback,

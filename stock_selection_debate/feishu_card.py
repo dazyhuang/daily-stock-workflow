@@ -46,8 +46,7 @@ def build_debate_card(debate_result: Dict, market_context: str = "") -> dict:
                 "content": (
                     f"{rank_emoji} **{c.get('name', '?')} {c.get('stock', '?')}** "
                     f"| 综合分: **{c.get('final_score', 0)}** "
-                    f"| 置信度: {conviction_emoji}{c.get('conviction', '?')} "
-                    f"| 仓位: **{c.get('position_ratio', '?')}**\n"
+                    f"| 置信度: {conviction_emoji}{c.get('conviction', '?')}\n"
                     f"　　信号: {signal_emoji}BUY\n"
                     f"　　Bull: {bull}\n"
                     f"　　Bear: {bear}\n"
@@ -73,8 +72,7 @@ def build_debate_card(debate_result: Dict, market_context: str = "") -> dict:
                 "content": (
                     f"{i}. **{c.get('name', '?')} {c.get('stock', '?')}** "
                     f"| 分:{c.get('final_score', 0)} "
-                    f"| {conviction_emoji}{c.get('conviction', '?')} "
-                    f"| 仓位:{c.get('position_ratio', '?')}\n"
+                    f"| {conviction_emoji}{c.get('conviction', '?')}\n"
                     f"　　{c.get('verdict', '')}"
                 ),
             }

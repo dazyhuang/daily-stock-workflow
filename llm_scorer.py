@@ -34,7 +34,7 @@ if _ENV_FILE.exists():
                 os.environ.setdefault(k, v)
 os.environ.setdefault("MINIMAX_ALLOW_MX_DIRECT_KEY", "1")
 
-logger = logging.getLogger("llm_scorer")
+logger = logging.getLogger("daily_stock_workflow.llm_scorer")
 
 
 class LLMScorer:
@@ -45,7 +45,7 @@ class LLMScorer:
         self.timeout = timeout
         self.api_key = api_key or os.environ.get("MX_DIRECT_KEY", "") or os.environ.get("MX_APIKEY", "")
         self.output_dir = output_dir
-        # 火山引擎 coding plan 主 + GPT-5.5 / MiniMax M3 兜底（_call_api_direct 内部处理）
+        # 火山引擎 coding plan 主 + GPT-5.6 Sol / MiniMax M3 兜底（_call_api_direct 内部处理）
         self._use_direct_api = True
         self._check_openclaw()
 
@@ -130,7 +130,7 @@ class LLMScorer:
             return ""
 
     def _call_api_direct(self, prompt: str) -> str:
-        """火山引擎 coding plan（深度思考）→ GPT-5.5 → MiniMax M3 兜底"""
+        """火山引擎 coding plan（深度思考）→ GPT-5.6 Sol → MiniMax M3 兜底"""
         import requests
 
         if not isinstance(prompt, str):
@@ -143,7 +143,7 @@ class LLMScorer:
             text = call_llm_with_fallback(
                 prompt=prompt,
                 model=self.model,
-                fallback_model="openai/gpt-5.5",
+                fallback_model="openai/gpt-5.6-sol",
                 secondary_fallback_model="minimax-portal/MiniMax-M3",
                 timeout=self.timeout,
                 retries=3,
@@ -168,7 +168,7 @@ class LLMScorer:
                         logger.info(f"{used_model[0] or self.model} 响应(find): {end - start} chars")
                         return text[start:end]
         except Exception as e:
-            logger.error(f"GPT-5.5/MiniMax 统一调用失败: {e}")
+            logger.error(f"GPT-5.6 Sol/MiniMax 统一调用失败: {e}")
 
         # 兼容显式指定旧火山模型的手工调试；默认工作流不会进入这里。
         volc_key = os.environ.get("VOLCAN_API_KEY", "")
@@ -183,7 +183,7 @@ class LLMScorer:
                             "messages": [{"role": "user", "content": prompt}],
                             "max_tokens": 12000,
                             "temperature": 0.3,
-                            
+
                         },
                         timeout=self.timeout,
                     )
@@ -228,7 +228,7 @@ class LLMScorer:
                                     "messages": [{"role": "user", "content": prompt[:32000]}],
                                     "max_tokens": 12000,
                                     "temperature": 0.3,
-                                    
+
                                 },
                                 timeout=self.timeout,
                             )
@@ -266,7 +266,7 @@ class LLMScorer:
                     json={
                         "model": "MiniMax-M3",
                         "max_tokens": 12000,
-                        
+
                         "messages": [{"role": "user", "content": prompt}],
                     },
                     timeout=self.timeout,
@@ -1745,7 +1745,11 @@ def _fetch_financial_via_xtquant(stock_code: str) -> Optional[Dict]:
     try:
         import urllib.request, json
         full_code = _ensure_suffix(stock_code)
-        url = f"http://127.0.0.1:8080/financial_data?stocks={full_code}&tables=PERSHAREINDEX"
+        bridge_url = os.environ.get(
+            "QMT_HTTP_URL",
+            os.environ.get("XQSHARE_HTTP_BASE", "http://127.0.0.1:8080"),
+        ).rstrip("/")
+        url = f"{bridge_url}/financial_data?stocks={full_code}&tables=PERSHAREINDEX"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             raw = json.loads(resp.read().decode("utf-8"))
@@ -1783,6 +1787,8 @@ def _fetch_financial_via_xtquant(stock_code: str) -> Optional[Dict]:
                               key=lambda r: str(r[col_idx["m_timetag"]]), reverse=True)
         annual_row = annual_rows[0] if annual_rows else None
         quarter_row = quarter_rows[0] if quarter_rows else None
+        annual_as_of = re.sub(r"\D", "", str(annual_row[col_idx["m_timetag"]]))[:8] if annual_row and "m_timetag" in col_idx else ""
+        quarter_as_of = re.sub(r"\D", "", str(quarter_row[col_idx["m_timetag"]]))[:8] if quarter_row and "m_timetag" in col_idx else ""
         roe_annual = get_val(annual_row, "equity_roe") if annual_row else None
         if roe_annual is None:
             return None
@@ -1805,7 +1811,7 @@ def _fetch_financial_via_xtquant(stock_code: str) -> Optional[Dict]:
             bps = get_val(quarter_row, "s_fa_bps") if quarter_row else None
             if eps and eps > 0:
                 # 从 HTTP 获取最新收盘价
-                price_url = f"http://127.0.0.1:8080/market_data3?stock={full_code}&period=1d&count=1"
+                price_url = f"{bridge_url}/market_data3?stock={full_code}&period=1d&count=1"
                 preq = urllib.request.Request(price_url, headers={"User-Agent": "Mozilla/5.0"})
                 with urllib.request.urlopen(preq, timeout=10) as pr:
                     pd_data = json.loads(pr.read().decode("utf-8"))
@@ -1832,6 +1838,10 @@ def _fetch_financial_via_xtquant(stock_code: str) -> Optional[Dict]:
             "连续三年盈利": profitable_years >= 3,
             "pe": pe,
             "pb": pb,
+            "_as_of": quarter_as_of or annual_as_of,
+            "_annual_as_of": annual_as_of,
+            "_quarter_as_of": quarter_as_of,
+            "_source": "xqshare",
         }
     except Exception as e:
         logger.warning(f"QMT HTTP 财务数据获取失败 {stock_code}: {e}")
@@ -1886,12 +1896,21 @@ def _fetch_financial_via_mx(stock_code: str) -> Optional[Dict]:
         roe = get_val("净资产收益率", "ROE", "roe")
         if roe is None:
             return None
+        as_of = ""
+        for key, value in row.items():
+            if any(token in str(key).lower() for token in ("date", "日期", "报告期", "截止")):
+                digits = re.sub(r"\D", "", str(value or ""))
+                if len(digits) >= 8:
+                    as_of = digits[:8]
+                    break
         return {
             "roe_annual_latest": roe,
             "roe_quarter_latest": get_val("净资产收益率(单季度)"),
             "营收增速": get_val("营业总收入同比", "营收同比"),
             "净利润增长率": get_val("净利润同比", "净利润增长"),
             "负债率": get_val("资产负债率"),
+            "_as_of": as_of,
+            "_source": "mx-data",
         }
     except Exception as e:
         logger.warning(f"mx_data 财务数据获取失败（今日可能已达上限） {stock_code}: {e}")
@@ -1928,12 +1947,24 @@ def _fetch_financial_via_akshare(stock_code: str) -> Optional[Dict]:
         roe = get_val(["净资产收益率", "ROE"], None)
         if roe is None:
             return None
+        as_of = ""
+        for column in df.columns:
+            if any(token in str(column).lower() for token in ("date", "日期", "报告期", "截止")):
+                digits = re.sub(r"\D", "", str(latest.get(column) or ""))
+                if len(digits) >= 8:
+                    as_of = digits[:8]
+                    break
+        if not as_of:
+            digits = re.sub(r"\D", "", str(getattr(latest, "name", "") or ""))
+            as_of = digits[:8] if len(digits) >= 8 else ""
         return {
             "roe_annual_latest": roe,
             "roe_quarter_latest": get_val(["净资产收益率(单季度)"]),
             "营收增速": get_val(["营业总收入同比增长率"]),
             "净利润增长率": get_val(["净利润同比增长率"]),
             "负债率": get_val(["资产负债率"]),
+            "_as_of": as_of,
+            "_source": "akshare",
         }
     except Exception as e:
         logger.warning(f"akshare 财务数据获取失败 {stock_code}: {e}")
@@ -1964,57 +1995,134 @@ XUANGU_SCREEN_CONFIGS = [
     {
         "screen_id": "startup_setup",
         "pool": "准备启动",
-        "query": "A股 5日均线、10日均线、20日均线重合 上个交易日K线突破5日均线 近10日主力资金净流入 成交量放量",
+        "query": (
+            "A股 非ST "
+            "上个交易日5日均线与上个交易日10日均线绝对偏离小于1.5% "
+            "上个交易日5日均线与上个交易日20日均线绝对偏离小于1.5% "
+            "上个交易日收盘价高于上个交易日5日均线 "
+            "上个交易日收盘价高于上个交易日10日均线 "
+            "上个交易日涨幅0%到4% 上个交易日量比1.2到2.5 "
+            "上个交易日换手率1%到15% "
+            "上个交易日及上上个交易日及上上上个交易日主力净额合计大于500万元 "
+            "上个交易日收盘价较20个交易日前收盘价涨幅-8%到15%"
+        ),
         "strategy_type": "capital_absorption_dip",
-        "entry_bias": "资金吸筹背离，优先等待止跌企稳或低吸挂单",
+        "entry_bias": "均线压缩后转强，优先选择量价温和且资金连续流入的启动点",
         "priority": 30,
+        "top_n": 20,
+        "recall_n": 40,
+        "min_final_n": 8,
+        "expected_recall": "15-30",
     },
     {
         "screen_id": "breakout_high",
         "pool": "突破新高",
-        "query": "A股 股价突破20日高点 上个交易日成交量放大超过1.5倍",
+        "query": (
+            "A股 非ST 上个交易日收盘价不低于此前20日最高收盘价的97% "
+            "上个交易日涨幅2%到7% 上个交易日非涨停 "
+            "上个交易日量比1.3到2.5 上个交易日换手率2%到15% "
+            "上个交易日收盘价距离上个交易日最高价小于等于2% "
+            "上个交易日主力净额大于0 "
+            "上个交易日收盘价较10个交易日前收盘价涨幅-2%到15%"
+        ),
         "strategy_type": "momentum_breakout",
-        "entry_bias": "趋势确认后可小幅追随，但需防假突破",
+        "entry_bias": "距20日高点3%内的放量蓄势或突破，排除涨停和短期过热",
         "priority": 20,
+        "top_n": 20,
+        "recall_n": 60,
+        "min_final_n": 10,
+        "expected_recall": "25-60",
     },
     {
         "screen_id": "first_limit",
         "pool": "首板追击",
-        "query": "A股 上个交易日首板涨停 非ST 封单超过5000手",
+        "query": (
+            "A股 非ST 上个交易日近20日首次涨停 上个交易日非一字板 "
+            "上个交易日换手率2%到20% 上个交易日开板次数小于等于3 "
+            "上个交易日首次封板时间早于14点30分 上个交易日收盘封死涨停 "
+            "上个交易日收盘价较20个交易日前收盘价涨幅小于等于25%"
+        ),
         "strategy_type": "limit_follow",
-        "entry_bias": "只在强承接和非一字高开时谨慎跟随",
+        "entry_bias": "只保留低位换手首板，排除一字板、反复炸板和累计涨幅过高",
         "priority": 10,
+        "top_n": 10,
+        "recall_n": 20,
+        "min_final_n": 3,
+        "expected_recall": "3-12",
     },
     {
         "screen_id": "sector_leader",
         "pool": "热点龙头",
-        "query": "A股 上个交易日所属板块涨幅排名前3 成分股 非ST",
+        "query": (
+            "A股 非ST 上个交易日涨幅2%到8% 上个交易日非涨停 "
+            "上个交易日换手率1.5%到15% 上个交易日成交额大于1亿元"
+        ),
         "strategy_type": "sector_leader",
-        "entry_bias": "跟随强势板块，等待龙头分歧低吸或换手确认",
+        "entry_bias": "本地计算上涨家数比例后，从前三强势行业中选择成交活跃且收近高位的龙头",
         "priority": 40,
+        "screen_mode": "local_hot_sector",
+        "sector_count": 3,
+        "sector_breadth_min": 0.60,
+        "sector_stock_top_n": 5,
+        "sector_stock_recall_n": 8,
+        "top_n": 15,
+        "recall_n": 24,
+        "min_final_n": 5,
+        "expected_recall": "6-15",
     },
     {
         "screen_id": "strong_reversal",
         "pool": "强势反包",
-        "query": "A股 前两个交易日下跌 上个交易日上涨 涨幅大于5%",
+        "query": (
+            "A股 非ST 上上个交易日涨跌幅小于0 上上上个交易日涨跌幅小于0 "
+            "上个交易日之前两个交易日累计涨跌幅-12%到-2% "
+            "上个交易日收盘价高于上上个交易日最高价 "
+            "上个交易日涨幅2.5%到9.5% 上个交易日非涨停 "
+            "上个交易日量比1.1到3.5 "
+            "上个交易日RSI6在40到75之间 "
+            "上个交易日收盘价较20个交易日前收盘价涨幅-15%到25% "
+            "上个交易日主力净额大于0"
+        ),
         "strategy_type": "reversal_confirm",
-        "entry_bias": "反包后等待回踩不破或继续放量确认",
+        "entry_bias": "只保留收盘越过前一日最高价的真反包，并要求量能与资金确认",
         "priority": 35,
+        "top_n": 12,
+        "recall_n": 24,
+        "min_final_n": 3,
+        "expected_recall": "3-12",
     },
     {
         "screen_id": "capital_absorption",
         "pool": "资金异动",
-        "query": "A股 近三日股价下跌 近三日每日主力资金都是净流入",
+        "query": (
+            "A股 非ST "
+            "上个交易日及上上个交易日及上上上个交易日累计涨跌幅-8%到-2% "
+            "上个交易日及上上个交易日及上上上个交易日主力净额合计大于0 "
+            "上个交易日超大单净额大于0 "
+            "上个交易日成交量小于上上个交易日成交量 "
+            "上上个交易日成交量小于上上上个交易日成交量 "
+            "上个交易日涨跌幅-3%到1% 上个交易日换手率1%到12% "
+            "上个交易日收盘价在此前20个交易日最高价与最低价区间的位置小于等于70%"
+        ),
         "strategy_type": "startup_dip",
-        "entry_bias": "等待放量上攻确认或回踩企稳，偏低吸，不追高",
+        "entry_bias": "缩量回落但主力与超大单流入，等待止跌或放量转强，不追高",
         "priority": 25,
+        "top_n": 20,
+        "recall_n": 60,
+        "min_final_n": 8,
+        "expected_recall": "20-50",
     },
 ]
 
 
 XUANGU_POOL_TOP_N = 20
 XUANGU_POOL_SCAN_LIMIT = 300
-XUANGU_POOL_RANKING_VERSION = "pool-rank-v1"
+XUANGU_POOL_RANKING_VERSION = "pool-rank-v3-two-stage"
+SCREENING_LOCAL_VERSION = "local-screen-v2"
+SCREENING_BENCHMARK = "000300.SH"
+SCREENING_MIN_KLINE_COVERAGE = 0.50
+HOT_SECTOR_HISTORY_VERSION = "hot-sector-history-v1"
+ANNOUNCEMENT_RISK_VERSION = "announcement-risk-v2-recent7d"
 
 
 def _xuangu_safe_filename(query: str, max_len: int = 80) -> str:
@@ -2027,6 +2135,10 @@ def _xuangu_safe_filename(query: str, max_len: int = 80) -> str:
 def _screening_signature(configs: List[Dict] = None) -> str:
     payload = {
         "ranking_version": XUANGU_POOL_RANKING_VERSION,
+        "local_screening_version": SCREENING_LOCAL_VERSION,
+        "announcement_risk_version": ANNOUNCEMENT_RISK_VERSION,
+        "screening_benchmark": SCREENING_BENCHMARK,
+        "minimum_kline_coverage": SCREENING_MIN_KLINE_COVERAGE,
         "pool_top_n": XUANGU_POOL_TOP_N,
         "configs": [
             {
@@ -2034,6 +2146,14 @@ def _screening_signature(configs: List[Dict] = None) -> str:
                 "query": c.get("query"),
                 "pool": c.get("pool"),
                 "strategy_type": c.get("strategy_type"),
+                "top_n": c.get("top_n", XUANGU_POOL_TOP_N),
+                "recall_n": c.get("recall_n"),
+                "min_final_n": c.get("min_final_n"),
+                "screen_mode": c.get("screen_mode", "mx_xuangu"),
+                "sector_count": c.get("sector_count"),
+                "sector_breadth_min": c.get("sector_breadth_min"),
+                "sector_stock_top_n": c.get("sector_stock_top_n"),
+                "sector_stock_recall_n": c.get("sector_stock_recall_n"),
             }
             for c in (configs or XUANGU_SCREEN_CONFIGS)
         ],
@@ -2098,6 +2218,62 @@ def _row_numeric_value(row: Dict, key_groups: List[List[str]], deny: List[str] =
     return None
 
 
+def _row_historical_numeric_values(
+    row: Dict,
+    fragments: List[str],
+    deny: List[str] = None,
+) -> List[tuple[str, float]]:
+    """Return dated values up to the last completed day, newest first."""
+    deny = deny or []
+    today = date.today().strftime("%Y%m%d")
+    values: List[tuple[str, float]] = []
+    for key, value in (row or {}).items():
+        header = str(key or "")
+        if any(block in header for block in deny):
+            continue
+        if not all(fragment in header for fragment in fragments):
+            continue
+        dates = [re.sub(r"\D", "", x) for x in re.findall(r"20\d{2}[.\-/]\d{2}[.\-/]\d{2}", header)]
+        completed_dates = [x for x in dates if len(x) == 8 and x < today]
+        if not completed_dates:
+            continue
+        parsed = _parse_cn_number(value)
+        if parsed is not None:
+            values.append((max(completed_dates), parsed))
+    values.sort(key=lambda x: x[0], reverse=True)
+    return values
+
+
+def _row_previous_numeric_value(
+    row: Dict,
+    key_groups: List[List[str]],
+    deny: List[str] = None,
+    *,
+    fallback: bool = True,
+) -> Optional[float]:
+    """Prefer the most recent completed trading-day column over live fields."""
+    for fragments in key_groups:
+        values = _row_historical_numeric_values(row, fragments, deny=deny)
+        if values:
+            return values[0][1]
+    return _row_numeric_value(row, key_groups, deny=deny) if fallback else None
+
+
+def _row_ratio_pct_value(row: Dict, key_groups: List[List[str]]) -> Optional[float]:
+    value = _row_numeric_value(row, key_groups)
+    if value is None:
+        return None
+    return value * 100.0 if abs(value) <= 2.0 else value
+
+
+def _row_time_minutes(row: Dict, fragments: List[str]) -> Optional[int]:
+    value = _row_text_value(row, fragments)
+    match = re.search(r"(\d{1,2}):(\d{2})", value)
+    if not match:
+        return None
+    return int(match.group(1)) * 60 + int(match.group(2))
+
+
 def _cap_score(value: Optional[float], cap: float, weight: float) -> float:
     if value is None or cap <= 0:
         return 0.0
@@ -2143,20 +2319,36 @@ def _xuangu_exclusion_reason(row: Dict) -> str:
 
 def _score_xuangu_row(row: Dict, cfg: Dict) -> (float, Dict):
     strategy = cfg.get("strategy_type", "")
-    pct = _row_numeric_value(row, [["涨跌幅", "%"], ["CHG<70>"]], deny=["区间", "涨跌额"])
+    pct = _row_previous_numeric_value(
+        row,
+        [["涨跌幅", "%"], ["CHG<70>"]],
+        deny=["区间", "涨跌额"],
+    )
     interval_pct = _row_numeric_value(row, [["区间涨跌幅"]])
-    main_flow = _row_numeric_value(row, [["主力净额"], ["主力资金净流入"]])
+    main_flow = _row_numeric_value(row, [["主力净额合计"], ["主力净额"], ["主力资金净流入"]])
+    super_flow = _row_previous_numeric_value(row, [["超大单净额"]])
     north_flow = _row_numeric_value(row, [["沪深股通净买入额"], ["北向资金"]])
-    volume_ratio = _row_numeric_value(row, [["量比"]])
+    volume_ratio = _row_previous_numeric_value(row, [["量比"]])
     volume_growth = _row_numeric_value(row, [["成交量环比增长率"]])
-    turnover = _row_numeric_value(row, [["换手率"]])
-    amount = _row_numeric_value(row, [["成交额"]])
+    turnover = _row_previous_numeric_value(row, [["换手率"]])
+    amount = _row_previous_numeric_value(row, [["成交额"]])
     pe = _row_numeric_value(row, [["市盈率"]])
     pb = _row_numeric_value(row, [["市净率"]])
     market_cap = _row_numeric_value(row, [["总市值"]])
-    price = _row_numeric_value(row, [["最新价"]])
-    high = _row_numeric_value(row, [["最高价", "(元)"]])
+    price = _row_previous_numeric_value(row, [["收盘价", "(元)"], ["最新价"]], deny=["20个交易日前", "区间"])
+    high = _row_previous_numeric_value(row, [["最高价", "(元)"]], deny=["区间"])
     seal = _row_numeric_value(row, [["涨停封单量"]])
+    seal_amount = _row_numeric_value(row, [["涨停封单额"]])
+    ma_gap_5_10 = _row_ratio_pct_value(row, [["5日均线", "10日均线", "绝对值"]])
+    ma_gap_5_20 = _row_ratio_pct_value(row, [["5日均线", "20日均线", "绝对值"]])
+    return_20d = _row_ratio_pct_value(row, [["上个交易日", "20个交易日前"]])
+    return_10d = _row_ratio_pct_value(row, [["上个交易日", "10个交易日前"]])
+    close_position_20d = _row_ratio_pct_value(row, [["前20个交易日区间最低价", "区间最高价"]])
+    open_count = _row_numeric_value(row, [["涨停打开次数"]])
+    first_seal_minutes = _row_time_minutes(row, ["涨停首次封板时间"])
+    dated_volumes = _row_historical_numeric_values(row, ["成交量", "(股)"])
+    dated_interval_returns = _row_historical_numeric_values(row, ["区间涨跌幅"])
+    dated_main_flows = _row_historical_numeric_values(row, ["主力净额", "(元)"])
 
     score = 0.0
     detail: Dict[str, Any] = {}
@@ -2188,35 +2380,62 @@ def _score_xuangu_row(row: Dict, cfg: Dict) -> (float, Dict):
         add("tradable_size", market_cap, _range_score(market_cap, 3000000000.0, 300000000000.0, 4, floor=500000000.0, ceiling=1200000000000.0))
 
     if strategy == "startup_dip":
-        add("main_flow", main_flow, _cap_score(main_flow, 500000000.0, 26))
-        add("north_flow", north_flow, _cap_score(north_flow, 200000000.0, 6))
-        add("volume_ratio", volume_ratio, _range_score(volume_ratio, 1.1, 3.5, 13, floor=0.5, ceiling=8))
-        add("volume_growth", volume_growth, _cap_score(volume_growth, 120.0, 8))
-        add("price_not_overheated", pct, _range_score(pct, -2, 7, 13, floor=-8, ceiling=12))
-        if pct is not None and pct > 10:
-            add("overheat_penalty", pct, -8)
+        three_day_pullback = (
+            sum(value for _, value in dated_interval_returns[:3])
+            if len(dated_interval_returns) >= 3
+            else interval_pct
+        )
+        add("main_flow", main_flow, _cap_score(main_flow, 400000000.0, 24))
+        add("super_flow", super_flow, _cap_score(super_flow, 150000000.0, 12))
+        if len(dated_main_flows) >= 3:
+            positive_days = sum(1 for _, value in dated_main_flows[:3] if value > 0)
+            add("main_flow_positive_days", positive_days, 6 if positive_days >= 2 else -4)
+        add("three_day_pullback", three_day_pullback, _range_score(three_day_pullback, -8, -2, 14, floor=-12, ceiling=2))
+        if close_position_20d is not None:
+            add("low_price_position", close_position_20d, _range_score(close_position_20d, 15, 70, 12, floor=0, ceiling=90))
+        add("decline_stabilizing", pct, _range_score(pct, -3, 1, 10, floor=-7, ceiling=4))
+        if len(dated_volumes) >= 3:
+            contracting = dated_volumes[0][1] < dated_volumes[1][1] < dated_volumes[2][1]
+            add("volume_contraction", 1.0 if contracting else 0.0, 8 if contracting else -4)
+        if main_flow is not None and main_flow <= 0:
+            add("flow_not_confirmed", main_flow, -12)
     elif strategy == "capital_absorption_dip":
-        add("main_flow", main_flow, _cap_score(main_flow, 500000000.0, 30))
-        add("north_flow", north_flow, _cap_score(north_flow, 200000000.0, 8))
-        add("dip_with_inflow", pct, _range_score(pct, -6, 2, 16, floor=-10, ceiling=6))
-        add("volume_ratio", volume_ratio, _range_score(volume_ratio, 0.8, 2.8, 8, floor=0.3, ceiling=6))
+        add("main_flow", main_flow, _cap_score(main_flow, 400000000.0, 28))
+        add("north_flow", north_flow, _cap_score(north_flow, 200000000.0, 5))
+        if ma_gap_5_10 is not None and ma_gap_5_20 is not None:
+            max_gap = max(ma_gap_5_10, ma_gap_5_20)
+            add("ma_compression", max_gap, _range_score(max_gap, 0, 1.5, 14, floor=0, ceiling=3))
+        add("gentle_breakout", pct, _range_score(pct, 0, 4, 12, floor=-2, ceiling=7))
+        add("volume_ratio", volume_ratio, _range_score(volume_ratio, 1.2, 2.5, 12, floor=0.7, ceiling=4))
+        add("twenty_day_control", return_20d, _range_score(return_20d, -8, 15, 10, floor=-15, ceiling=25))
         if pct is not None and pct > 5:
-            add("chase_penalty", pct, -8)
+            add("chase_penalty", pct, -10)
     elif strategy == "momentum_breakout":
-        add("breakout_pct", pct, _range_score(pct, 2, 10, 18, floor=0, ceiling=16))
-        add("volume_growth", volume_growth, _cap_score(volume_growth, 200.0, 18))
-        add("volume_ratio", volume_ratio, _range_score(volume_ratio, 1.5, 4.5, 12, floor=0.8, ceiling=9))
-        add("liquidity_breakout", amount, _cap_score(amount, 5000000000.0, 10))
+        add("breakout_pct", pct, _range_score(pct, 2, 7, 16, floor=0, ceiling=10))
+        add("main_flow", main_flow, _cap_score(main_flow, 300000000.0, 16))
+        add("volume_ratio", volume_ratio, _range_score(volume_ratio, 1.3, 2.5, 13, floor=0.8, ceiling=4))
+        add("liquidity_breakout", amount, _cap_score(amount, 3000000000.0, 8))
         if price is not None and high and high > 0:
             close_pos = price / high
-            add("close_near_high", close_pos, _range_score(close_pos, 0.965, 1.01, 10, floor=0.9, ceiling=1.05))
-        if pct is not None and pct > 12:
-            add("overheat_penalty", pct, -8)
+            add("close_near_high", close_pos, _range_score(close_pos, 0.98, 1.01, 11, floor=0.94, ceiling=1.04))
+        add("ten_day_not_overheated", return_10d, _range_score(return_10d, -2, 15, 8, floor=-8, ceiling=25))
+        if pct is not None and pct > 8:
+            add("overheat_penalty", pct, -10)
     elif strategy == "limit_follow":
-        add("seal_strength", seal, _cap_score(seal, 30000000.0, 32))
-        add("limit_pct", pct, _range_score(pct, 9.6, 10.3, 18, floor=8.0, ceiling=12.5))
-        add("turnover_for_board", turnover, _range_score(turnover, 0.5, 12, 10, floor=0, ceiling=35))
+        add("seal_strength", seal_amount, _cap_score(seal_amount, 100000000.0, 18))
+        add("seal_volume", seal, _cap_score(seal, 30000000.0, 8))
+        add("turnover_for_board", turnover, _range_score(turnover, 2, 20, 12, floor=0.5, ceiling=30))
         add("board_liquidity", amount, _cap_score(amount, 2000000000.0, 8))
+        if open_count is not None:
+            add("board_open_control", open_count, _range_score(open_count, 0, 2, 10, floor=0, ceiling=5))
+        if first_seal_minutes is not None:
+            early_points = max(0.0, min(10.0, (870.0 - first_seal_minutes) / 300.0 * 10.0))
+            add("early_first_seal", first_seal_minutes, early_points)
+        add("twenty_day_not_overheated", return_20d, _range_score(return_20d, -10, 25, 10, floor=-20, ceiling=40))
+        if turnover is not None and turnover < 2:
+            add("one_word_board_penalty", turnover, -14)
+        if turnover is not None and turnover > 20:
+            add("board_turnover_overheat", turnover, -10)
     elif strategy == "sector_leader":
         add("leader_pct", pct, _range_score(pct, 3, 10, 18, floor=0, ceiling=20))
         add("leader_liquidity", amount, _cap_score(amount, 5000000000.0, 18))
@@ -2227,10 +2446,12 @@ def _score_xuangu_row(row: Dict, cfg: Dict) -> (float, Dict):
         if turnover is not None and turnover > 45:
             add("turnover_overheat_penalty", turnover, -10)
     elif strategy == "reversal_confirm":
-        add("reversal_pct", pct, _range_score(pct, 5, 9.8, 22, floor=2, ceiling=13))
-        add("two_day_control", interval_pct, _range_score(interval_pct, -8, 8, 8, floor=-15, ceiling=18))
-        add("volume_ratio", volume_ratio, _range_score(volume_ratio, 1.0, 3.5, 10, floor=0.5, ceiling=8))
-        add("reversal_liquidity", amount, _cap_score(amount, 3000000000.0, 10))
+        add("reversal_pct", pct, _range_score(pct, 2.5, 9.5, 20, floor=1, ceiling=12))
+        add("two_day_pullback", interval_pct, _range_score(interval_pct, -12, -2, 10, floor=-18, ceiling=2))
+        add("main_flow", main_flow, _cap_score(main_flow, 300000000.0, 18))
+        add("volume_ratio", volume_ratio, _range_score(volume_ratio, 1.1, 3.5, 11, floor=0.6, ceiling=6))
+        add("reversal_liquidity", amount, _cap_score(amount, 3000000000.0, 8))
+        add("twenty_day_control", return_20d, _range_score(return_20d, -15, 25, 8, floor=-25, ceiling=40))
         if pct is not None and pct > 10.5:
             add("overheat_penalty", pct, -8)
     else:
@@ -2270,6 +2491,1082 @@ def _rank_xuangu_rows_for_pool(rows: List[Dict], cfg: Dict, top_n: int = XUANGU_
     }
 
 
+def _safe_float(value: Any) -> Optional[float]:
+    try:
+        if value in (None, "", "--", "-"):
+            return None
+        result = float(str(value).replace(",", "").replace("%", ""))
+        return result if result == result else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_price(value: Any) -> Optional[float]:
+    """价格字段读取：A 股最小变动 0.01 元，自动 round 到 2 位消除 IEEE 754 精度尾巴。
+
+    只用于 close/open/high/low/prev_close 等价格字段，
+    不要用于 volume/amount/change_pct/score/timestamp 等非价格数值。
+    """
+    f = _safe_float(value)
+    if f is None:
+        return None
+    return round(f, 2)
+
+
+def _last_completed_trading_day() -> str:
+    current = date.today() - timedelta(days=1)
+    shared_dir = Path.home() / ".openclaw" / "agents" / "shared"
+    if shared_dir.exists() and str(shared_dir) not in sys.path:
+        sys.path.insert(0, str(shared_dir))
+    try:
+        from trading_calendar import is_a_share_trading_day
+        for _ in range(12):
+            compact = current.strftime("%Y%m%d")
+            if is_a_share_trading_day(compact):
+                return compact
+            current -= timedelta(days=1)
+    except Exception:
+        while current.weekday() >= 5:
+            current -= timedelta(days=1)
+    return current.strftime("%Y%m%d")
+
+
+def _compact_screening_date(value: Any) -> str:
+    text = str(value or "").strip()
+    match = re.search(r"(20\d{2})[-./]?(\d{2})[-./]?(\d{2})", text)
+    return "".join(match.groups()) if match else ""
+
+
+def _completed_screening_bars(klines: List[Dict[str, Any]], expected_day: str) -> List[Dict[str, Any]]:
+    by_day: Dict[str, Dict[str, Any]] = {}
+    for raw in klines or []:
+        if not isinstance(raw, dict):
+            continue
+        day = _compact_screening_date(raw.get("date") or raw.get("time"))
+        close = _safe_price(raw.get("close"))
+        if not day or day > expected_day or close is None or close <= 0:
+            continue
+        row = {
+            "date": day,
+            "open": _safe_price(raw.get("open")) or close,
+            "high": _safe_price(raw.get("high")) or close,
+            "low": _safe_price(raw.get("low")) or close,
+            "close": close,
+            "volume": _safe_float(raw.get("volume")) or 0.0,
+            "amount": _safe_float(raw.get("amount")) or 0.0,
+        }
+        by_day[day] = row
+    return [by_day[key] for key in sorted(by_day)]
+
+
+def _series_mean(values: List[float]) -> Optional[float]:
+    clean = [float(value) for value in values if value is not None]
+    return sum(clean) / len(clean) if clean else None
+
+
+def _series_return(values: List[float], days: int) -> Optional[float]:
+    if len(values) <= days or not values[-days - 1]:
+        return None
+    return (values[-1] / values[-days - 1] - 1.0) * 100.0
+
+
+def _count_listing_trading_days(listing_date: str, expected_day: str, cap: int = 60) -> Optional[int]:
+    start_key = _compact_screening_date(listing_date)
+    if not start_key or start_key.startswith("197001") or start_key > expected_day:
+        return 0 if start_key and start_key > expected_day else None
+    try:
+        start = datetime.datetime.strptime(start_key, "%Y%m%d").date()
+        end = datetime.datetime.strptime(expected_day, "%Y%m%d").date()
+    except ValueError:
+        return None
+    shared_dir = Path.home() / ".openclaw" / "agents" / "shared"
+    if shared_dir.exists() and str(shared_dir) not in sys.path:
+        sys.path.insert(0, str(shared_dir))
+    try:
+        from trading_calendar import is_a_share_trading_day
+    except Exception:
+        is_a_share_trading_day = None
+    count = 0
+    cursor = start
+    while cursor <= end and count < cap:
+        compact = cursor.strftime("%Y%m%d")
+        if (is_a_share_trading_day and is_a_share_trading_day(compact)) or (
+            is_a_share_trading_day is None and cursor.weekday() < 5
+        ):
+            count += 1
+        cursor += timedelta(days=1)
+    return count
+
+
+def _screening_market_context(benchmark_payload: Dict[str, Any], expected_day: str) -> Dict[str, Any]:
+    rows = _completed_screening_bars((benchmark_payload or {}).get("klines") or [], expected_day)
+    closes = [row["close"] for row in rows]
+    ma20 = _series_mean(closes[-20:]) if len(closes) >= 20 else None
+    ma60 = _series_mean(closes[-60:]) if len(closes) >= 60 else None
+    pct5 = _series_return(closes, 5)
+    pct20 = _series_return(closes, 20)
+    latest = closes[-1] if closes else None
+    regime = "neutral"
+    if latest is not None and ma20 is not None and ma60 is not None:
+        if latest > ma20 > ma60 and (pct5 or 0) > 0:
+            regime = "strong"
+        elif latest < ma20 and (pct5 or 0) < 0:
+            regime = "weak"
+    return {
+        "benchmark": str((benchmark_payload or {}).get("benchmark") or SCREENING_BENCHMARK),
+        "source": str((benchmark_payload or {}).get("source") or "none"),
+        "as_of": rows[-1]["date"] if rows else "",
+        "bar_count": len(rows),
+        "latest_close": round(latest, 3) if latest is not None else None,
+        "ma20": round(ma20, 3) if ma20 is not None else None,
+        "ma60": round(ma60, 3) if ma60 is not None else None,
+        "pct5": round(pct5, 3) if pct5 is not None else None,
+        "pct20": round(pct20, 3) if pct20 is not None else None,
+        "regime": regime,
+    }
+
+
+def _build_local_screening_features(
+    stock: str,
+    name: str,
+    stock_packet: Dict[str, Any],
+    market_context: Dict[str, Any],
+    expected_day: str,
+) -> Dict[str, Any]:
+    rows = _completed_screening_bars((stock_packet or {}).get("klines") or [], expected_day)
+    metadata = (stock_packet or {}).get("screening_metadata") or {}
+    closes = [row["close"] for row in rows]
+    volumes = [row["volume"] for row in rows]
+    amounts = [row["amount"] for row in rows if row.get("amount", 0) > 0]
+    latest = rows[-1] if rows else {}
+    previous = rows[-2] if len(rows) >= 2 else {}
+    ma5 = _series_mean(closes[-5:]) if len(closes) >= 5 else None
+    ma20 = _series_mean(closes[-20:]) if len(closes) >= 20 else None
+    prior_ma5 = _series_mean(closes[-10:-5]) if len(closes) >= 10 else None
+    prior_ma20 = _series_mean(closes[-25:-5]) if len(closes) >= 25 else None
+    pct1 = _series_return(closes, 1)
+    pct5 = _series_return(closes, 5)
+    pct10 = _series_return(closes, 10)
+    pct20 = _series_return(closes, 20)
+    close = latest.get("close")
+    prev_close = previous.get("close")
+    day_range = (latest.get("high") or 0) - (latest.get("low") or 0) if latest else 0
+    close_position_day = (
+        (close - latest["low"]) / day_range * 100.0
+        if close is not None and day_range > 0 else None
+    )
+    upper_shadow_pct = (
+        max(0.0, latest["high"] - max(latest["open"], close)) / close * 100.0
+        if close and latest else None
+    )
+    amplitude_pct = (
+        day_range / prev_close * 100.0 if day_range > 0 and prev_close else None
+    )
+    vol_prior5 = _series_mean(volumes[-6:-1]) if len(volumes) >= 6 else None
+    volume_ratio_1_5 = latest.get("volume") / vol_prior5 if latest.get("volume") and vol_prior5 else None
+    volume_ratio_5_20 = None
+    if len(volumes) >= 20:
+        recent5 = _series_mean(volumes[-5:])
+        base20 = _series_mean(volumes[-20:])
+        volume_ratio_5_20 = recent5 / base20 if recent5 and base20 else None
+    high20_prior = max(closes[-21:-1]) if len(closes) >= 21 else None
+    low20 = min(row["low"] for row in rows[-20:]) if len(rows) >= 20 else None
+    distance_ma20 = (close / ma20 - 1.0) * 100.0 if close and ma20 else None
+    breakout_vs_20d = (close / high20_prior - 1.0) * 100.0 if close and high20_prior else None
+    opening_gap = (latest["open"] / prev_close - 1.0) * 100.0 if latest and prev_close else None
+    limit_pct = 20.0 if stock.startswith(("300", "301", "688", "689")) else 10.0
+    at_limit = bool(
+        pct1 is not None and pct1 >= limit_pct - 0.35
+        and close_position_day is not None and close_position_day >= 95
+    )
+    listing_days = _count_listing_trading_days(str(metadata.get("listing_date") or ""), expected_day)
+    pullback_volume_contracting = None
+    if len(volumes) >= 4 and volumes[-2] > 0 and volumes[-3] > 0:
+        pullback_volume_contracting = volumes[-2] < volumes[-3]
+    return {
+        "version": SCREENING_LOCAL_VERSION,
+        "as_of": rows[-1]["date"] if rows else "",
+        "bar_count": len(rows),
+        "latest_close": round(close, 3) if close is not None else None,
+        "pct1": round(pct1, 3) if pct1 is not None else None,
+        "pct5": round(pct5, 3) if pct5 is not None else None,
+        "pct10": round(pct10, 3) if pct10 is not None else None,
+        "pct20": round(pct20, 3) if pct20 is not None else None,
+        "relative_strength_5d": round(pct5 - market_context["pct5"], 3)
+        if pct5 is not None and market_context.get("pct5") is not None else None,
+        "relative_strength_20d": round(pct20 - market_context["pct20"], 3)
+        if pct20 is not None and market_context.get("pct20") is not None else None,
+        "ma5": round(ma5, 3) if ma5 is not None else None,
+        "ma20": round(ma20, 3) if ma20 is not None else None,
+        "ma5_slope_pct": round((ma5 / prior_ma5 - 1.0) * 100.0, 3) if ma5 and prior_ma5 else None,
+        "ma20_slope_pct": round((ma20 / prior_ma20 - 1.0) * 100.0, 3) if ma20 and prior_ma20 else None,
+        "distance_ma20_pct": round(distance_ma20, 3) if distance_ma20 is not None else None,
+        "breakout_vs_20d_pct": round(breakout_vs_20d, 3) if breakout_vs_20d is not None else None,
+        "close_position_day": round(close_position_day, 3) if close_position_day is not None else None,
+        "upper_shadow_pct": round(upper_shadow_pct, 3) if upper_shadow_pct is not None else None,
+        "amplitude_pct": round(amplitude_pct, 3) if amplitude_pct is not None else None,
+        "opening_gap_pct": round(opening_gap, 3) if opening_gap is not None else None,
+        "volume_ratio_1_5": round(volume_ratio_1_5, 3) if volume_ratio_1_5 is not None else None,
+        "volume_ratio_5_20": round(volume_ratio_5_20, 3) if volume_ratio_5_20 is not None else None,
+        "latest_amount": round(latest.get("amount"), 2) if latest.get("amount") else None,
+        "avg_amount_20d": round(_series_mean(amounts[-20:]), 2) if amounts else None,
+        "low20": round(low20, 3) if low20 is not None else None,
+        "above_low20_pct": round((close / low20 - 1.0) * 100.0, 3) if close and low20 else None,
+        "at_limit_up": at_limit,
+        "pullback_volume_contracting": pullback_volume_contracting,
+        "listing_date": metadata.get("listing_date") or "",
+        "listing_trading_days": listing_days,
+        "expire_date": metadata.get("expire_date") or "",
+        "instrument_status": metadata.get("instrument_status"),
+        "sector": metadata.get("sector") or "",
+        "kline_source": str((((stock_packet or {}).get("data_contract") or {}).get("kline") or {}).get("source") or "none"),
+    }
+
+
+def _candidate_query_amount(candidate: Dict[str, Any]) -> Optional[float]:
+    direct = _safe_float(candidate.get("amount"))
+    values = [direct] if direct is not None else []
+    detail = candidate.get("pool_score_detail") if isinstance(candidate.get("pool_score_detail"), dict) else {}
+    for key, value in detail.items():
+        if str(key).endswith("_value") and any(token in str(key) for token in ("liquidity", "amount")):
+            parsed = _safe_float(value)
+            if parsed is not None:
+                values.append(parsed)
+    return max(values) if values else None
+
+
+def _local_screen_rejections(candidate: Dict[str, Any], features: Dict[str, Any], expected_day: str) -> List[str]:
+    reasons: List[str] = []
+    name = str(candidate.get("name") or "").upper()
+    pool = str(candidate.get("pool") or "")
+    if "ST" in name or "退" in name:
+        reasons.append("RISK_NAME")
+    if not features.get("bar_count"):
+        reasons.append("KLINE_MISSING")
+    elif int(features.get("bar_count") or 0) < 60:
+        reasons.append("KLINE_SHORT")
+    elif features.get("as_of") != expected_day:
+        reasons.append("KLINE_STALE")
+    price = features.get("latest_close")
+    if price is not None and price < 3.0:
+        reasons.append("LOW_PRICE")
+    listing_days = features.get("listing_trading_days")
+    if listing_days is not None and listing_days < 60:
+        reasons.append("NEW_LISTING_LT60")
+    expire_key = _compact_screening_date(features.get("expire_date"))
+    if expire_key and not expire_key.startswith("9999") and expire_key <= expected_day:
+        reasons.append("EXPIRED_SECURITY")
+    if features.get("at_limit_up") and pool != "首板追击":
+        reasons.append("LIMIT_UP_POOL_EXCLUSIVE")
+    latest_amount = features.get("latest_amount") or _candidate_query_amount(candidate)
+    avg_amount = features.get("avg_amount_20d")
+    if latest_amount is not None and (
+        latest_amount < 80000000
+        or (avg_amount is not None and latest_amount < 100000000 and avg_amount < 80000000)
+    ):
+        reasons.append("LOW_LIQUIDITY")
+    return list(dict.fromkeys(reasons))
+
+
+def _pool_local_adjustment(candidate: Dict[str, Any], features: Dict[str, Any]) -> tuple[float, Dict[str, Any]]:
+    points = 0.0
+    detail: Dict[str, Any] = {}
+
+    def add(key: str, value: Any, score: float) -> None:
+        nonlocal points
+        if abs(score) < 0.001:
+            return
+        points += score
+        detail[key] = round(score, 2)
+        if value is not None:
+            detail[f"{key}_value"] = value
+
+    if features.get("bar_count", 0) >= 60:
+        add("data_completeness", features.get("bar_count"), 2.0)
+    elif not features.get("bar_count"):
+        add("data_completeness", 0, -4.0)
+    rs5 = features.get("relative_strength_5d")
+    if rs5 is not None:
+        add("relative_strength", rs5, 5.0 if rs5 >= 5 else 3.0 if rs5 >= 2 else -5.0 if rs5 <= -5 else -2.0 if rs5 <= -2 else 0.0)
+    rs20 = features.get("relative_strength_20d")
+    if rs20 is not None:
+        add("relative_strength_20d", rs20, 3.0 if rs20 >= 5 else -3.0 if rs20 <= -5 else 0.0)
+    close_pos = features.get("close_position_day")
+    if close_pos is not None:
+        add("close_quality", close_pos, 2.0 if close_pos >= 70 else -3.0 if close_pos < 35 else 0.0)
+    upper = features.get("upper_shadow_pct")
+    if upper is not None and upper > 5:
+        add("upper_shadow_risk", upper, -4.0)
+    amplitude = features.get("amplitude_pct")
+    stock = str(candidate.get("stock") or "")
+    amplitude_cap = 18.0 if stock.startswith(("300", "301", "688", "689")) else 12.0
+    if amplitude is not None and amplitude > amplitude_cap:
+        add("amplitude_risk", amplitude, -3.0)
+    distance_ma20 = features.get("distance_ma20_pct")
+    if distance_ma20 is not None:
+        add("ma20_distance", distance_ma20, -5.0 if distance_ma20 > 12 else -2.0 if distance_ma20 > 8 else 0.0)
+
+    strategy = str(candidate.get("strategy_type") or "")
+    ma5_slope = features.get("ma5_slope_pct")
+    ma20_slope = features.get("ma20_slope_pct")
+    volume_ratio = features.get("volume_ratio_1_5")
+    if strategy == "capital_absorption_dip":
+        if ma20_slope is not None:
+            add("ma20_turn", ma20_slope, 4.0 if ma20_slope >= 0 else -5.0)
+        if ma5_slope is not None:
+            add("ma5_turn", ma5_slope, 3.0 if ma5_slope >= 0 else -3.0)
+        if volume_ratio is not None:
+            add("startup_volume", volume_ratio, 3.0 if 1.1 <= volume_ratio <= 2.5 else -4.0 if volume_ratio > 3.5 else 0.0)
+    elif strategy == "momentum_breakout":
+        breakout = features.get("breakout_vs_20d_pct")
+        if breakout is not None:
+            add("true_breakout", breakout, 6.0 if breakout >= 0 else 2.0 if breakout >= -3 else -5.0)
+    elif strategy == "limit_follow":
+        opening_gap = features.get("opening_gap_pct")
+        if opening_gap is not None:
+            add("first_board_open", opening_gap, 2.0 if opening_gap <= 5 else -4.0 if opening_gap > 8 else 0.0)
+        if features.get("sector_hot") is True:
+            add("hot_sector_confirmation", features.get("sector"), 3.0)
+    elif strategy == "reversal_confirm":
+        if volume_ratio is not None:
+            add("reversal_volume", volume_ratio, 4.0 if volume_ratio >= 1.2 else -3.0 if volume_ratio < 0.9 else 0.0)
+        if features.get("pullback_volume_contracting") is True:
+            add("pullback_contraction", True, 3.0)
+    elif strategy == "startup_dip":
+        support = features.get("above_low20_pct")
+        if support is not None:
+            add("low20_support", support, 3.0 if support >= 3 else -5.0 if support < 1 else 0.0)
+        if ma5_slope is not None:
+            add("ma5_stabilizing", ma5_slope, 4.0 if ma5_slope >= 0 else -3.0)
+        positive_days = (candidate.get("pool_score_detail") or {}).get("main_flow_positive_days_value")
+        if positive_days is not None:
+            add("flow_consistency", positive_days, 4.0 if positive_days >= 2 else -3.0)
+    elif strategy == "sector_leader" and candidate.get("sector_rank"):
+        rank = int(candidate.get("sector_rank"))
+        add("sector_rank", rank, 4.0 if rank == 1 else 2.0 if rank <= 3 else 0.0)
+    adjustment = round(max(-20.0, min(20.0, points)), 2)
+    detail["total"] = adjustment
+    return adjustment, detail
+
+
+def _dynamic_pool_quota(cfg: Dict[str, Any], market_context: Dict[str, Any]) -> int:
+    base = max(1, int(cfg.get("top_n", XUANGU_POOL_TOP_N)))
+    minimum = max(1, int(cfg.get("min_final_n", 1)))
+    regime = str(market_context.get("regime") or "neutral")
+    pool = str(cfg.get("pool") or "")
+    deltas = {
+        "strong": {"准备启动": -1, "突破新高": 3, "首板追击": 2, "热点龙头": 2, "强势反包": 1, "资金异动": -2},
+        "weak": {"准备启动": 2, "突破新高": -4, "首板追击": -3, "热点龙头": -2, "强势反包": 0, "资金异动": 3},
+    }
+    return max(minimum, base + int((deltas.get(regime) or {}).get(pool, 0)))
+
+
+def _write_local_screening_audit(output_dir: Path, payload: Dict[str, Any]) -> None:
+    try:
+        target_dir = output_dir / "xuangu"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        dated = target_dir / f"local_screening_{date.today().strftime('%Y%m%d')}.json"
+        latest = target_dir / "local_screening_latest.json"
+        for target in (dated, latest):
+            tmp = target.with_suffix(target.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(target)
+    except Exception as exc:
+        logger.warning(f"本地精筛审计保存失败: {exc}")
+
+
+def _refine_screening_candidates(
+    candidates: List[Dict[str, Any]],
+    configs: List[Dict[str, Any]],
+    output_dir: Path,
+    screening_packet: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    if not candidates:
+        return []
+    expected_day = _last_completed_trading_day()
+    cfg_by_pool = {str(cfg.get("pool")): cfg for cfg in configs}
+    if screening_packet is None:
+        try:
+            from stock_selection_debate.data_fetcher import prefetch_screening_data
+            screening_packet = prefetch_screening_data(candidates, benchmark_code=SCREENING_BENCHMARK)
+        except Exception as exc:
+            logger.warning(f"本地精筛数据预取失败，保留远程池排序: {exc}")
+            screening_packet = {}
+    market_context = _screening_market_context((screening_packet or {}).get("benchmark") or {}, expected_day)
+    stocks = (screening_packet or {}).get("stocks") or {}
+    hot_sectors = {
+        str(item.get("sector") or "").strip()
+        for item in candidates
+        if item.get("pool") == "热点龙头" and str(item.get("sector") or "").strip()
+    }
+    for item in candidates:
+        if item.get("pool") != "热点龙头":
+            continue
+        code = str(item.get("stock") or "").zfill(6)
+        metadata = (stocks.get(code) or {}).get("screening_metadata") or {}
+        cached_sector = str(metadata.get("sector") or "").strip()
+        if cached_sector:
+            hot_sectors.add(cached_sector)
+    market_context["hot_sectors"] = sorted(hot_sectors)
+    coverage = _safe_float(((screening_packet or {}).get("stats") or {}).get("coverage")) or 0.0
+    audit_rows: List[Dict[str, Any]] = []
+
+    def baseline(reason: str) -> List[Dict[str, Any]]:
+        selected: List[Dict[str, Any]] = []
+        for pool, cfg in cfg_by_pool.items():
+            rows = [dict(item) for item in candidates if item.get("pool") == pool]
+            rows.sort(key=lambda item: -float(item.get("pool_score") or 0))
+            quota = max(1, int(cfg.get("top_n", XUANGU_POOL_TOP_N)))
+            for rank, item in enumerate(rows[:quota], 1):
+                item["pool_rank"] = rank
+                item["query_pool_score"] = round(float(item.get("pool_score") or 0), 2)
+                item["dynamic_pool_quota"] = quota
+                item["local_screening"] = {
+                    "version": SCREENING_LOCAL_VERSION,
+                    "status": "degraded",
+                    "reason": reason,
+                    "market": market_context,
+                }
+                flags = list(item.get("data_quality_flags") or [])
+                item["data_quality_flags"] = list(dict.fromkeys(flags + ["LOCAL_SCREENING_DEGRADED"]))
+                selected.append(item)
+        _write_local_screening_audit(output_dir, {
+            "schema_version": SCREENING_LOCAL_VERSION,
+            "workflow_date": date.today().strftime("%Y%m%d"),
+            "as_of": expected_day,
+            "status": "degraded",
+            "reason": reason,
+            "coverage": coverage,
+            "market": market_context,
+            "selected": len(selected),
+        })
+        return selected
+
+    if coverage < SCREENING_MIN_KLINE_COVERAGE:
+        return baseline(f"K线覆盖率{coverage:.0%}低于{SCREENING_MIN_KLINE_COVERAGE:.0%}")
+
+    accepted_by_pool: Dict[str, List[Dict[str, Any]]] = {pool: [] for pool in cfg_by_pool}
+    recoverable_by_pool: Dict[str, List[Dict[str, Any]]] = {pool: [] for pool in cfg_by_pool}
+    recoverable_reasons = {"KLINE_MISSING", "KLINE_SHORT", "KLINE_STALE"}
+    for raw_candidate in candidates:
+        candidate = dict(raw_candidate)
+        stock = str(candidate.get("stock") or "").zfill(6)
+        pool = str(candidate.get("pool") or "")
+        packet = stocks.get(stock, {}) if isinstance(stocks.get(stock, {}), dict) else {}
+        features = _build_local_screening_features(
+            stock,
+            str(candidate.get("name") or ""),
+            packet,
+            market_context,
+            expected_day,
+        )
+        if features.get("sector") and not candidate.get("sector"):
+            candidate["sector"] = features["sector"]
+        candidate_sector = str(candidate.get("sector") or features.get("sector") or "").strip()
+        features["sector_hot"] = bool(candidate_sector and candidate_sector in hot_sectors)
+        rejections = _local_screen_rejections(candidate, features, expected_day)
+        adjustment, adjustment_detail = _pool_local_adjustment(candidate, features)
+        query_score = float(candidate.get("pool_score") or 0)
+        final_score = round(max(0.0, min(100.0, query_score + adjustment)), 2)
+        original_detail = dict(candidate.get("pool_score_detail") or {})
+        original_detail.update({
+            "query_pool_score": round(query_score, 2),
+            "local_adjustment": adjustment,
+            "local_adjustment_detail": adjustment_detail,
+        })
+        candidate["query_pool_score"] = round(query_score, 2)
+        candidate["pool_score"] = final_score
+        candidate["pool_score_detail"] = original_detail
+        candidate["screening_features"] = features
+        candidate["local_screening"] = {
+            "version": SCREENING_LOCAL_VERSION,
+            "status": "rejected" if rejections else "accepted",
+            "rejections": rejections,
+            "query_score": round(query_score, 2),
+            "adjustment": adjustment,
+            "final_score": final_score,
+            "market_regime": market_context.get("regime"),
+        }
+        audit_rows.append({
+            "stock": stock,
+            "name": candidate.get("name"),
+            "pool": pool,
+            "query_score": round(query_score, 2),
+            "adjustment": adjustment,
+            "final_score": final_score,
+            "rejections": rejections,
+            "features": features,
+            "selected": False,
+        })
+        if not rejections:
+            accepted_by_pool.setdefault(pool, []).append(candidate)
+        elif set(rejections).issubset(recoverable_reasons):
+            recoverable_by_pool.setdefault(pool, []).append(candidate)
+
+    selected: List[Dict[str, Any]] = []
+    selected_keys = set()
+    pool_stats = {}
+    for pool, cfg in cfg_by_pool.items():
+        accepted = accepted_by_pool.get(pool, [])
+        recoverable = recoverable_by_pool.get(pool, [])
+        accepted.sort(key=lambda item: -float(item.get("pool_score") or 0))
+        recoverable.sort(key=lambda item: -float(item.get("pool_score") or 0))
+        minimum = max(1, int(cfg.get("min_final_n", 1)))
+        restored = 0
+        while len(accepted) < minimum and recoverable:
+            item = recoverable.pop(0)
+            item["pool_score"] = round(max(0.0, float(item.get("pool_score") or 0) - 8.0), 2)
+            item["local_screening"]["status"] = "restored_for_pool_floor"
+            item["local_screening"]["floor_penalty"] = -8.0
+            item["local_screening"]["final_score"] = item["pool_score"]
+            detail = dict(item.get("pool_score_detail") or {})
+            detail["local_floor_penalty"] = -8.0
+            item["pool_score_detail"] = detail
+            flags = list(item.get("data_quality_flags") or [])
+            item["data_quality_flags"] = list(dict.fromkeys(flags + ["LOCAL_SCREENING_FLOOR_RESTORE"]))
+            accepted.append(item)
+            restored += 1
+        accepted.sort(key=lambda item: -float(item.get("pool_score") or 0))
+        quota = _dynamic_pool_quota(cfg, market_context)
+        picked = accepted[:quota]
+        for rank, item in enumerate(picked, 1):
+            item["pool_rank"] = rank
+            item["pool_scored_candidates"] = len(accepted)
+            item["dynamic_pool_quota"] = quota
+            item["reason"] = (
+                f"[{pool}]本地精筛{float(item.get('pool_score') or 0):.1f}/100 "
+                f"排名{rank}/{len(accepted)}"
+            )
+            selected.append(item)
+            selected_keys.add((str(item.get("stock") or "").zfill(6), pool))
+        pool_stats[pool] = {
+            "raw": len([item for item in candidates if item.get("pool") == pool]),
+            "accepted": len(accepted),
+            "restored": restored,
+            "quota": quota,
+            "selected": len(picked),
+        }
+    for row in audit_rows:
+        row["selected"] = (row["stock"], row["pool"]) in selected_keys
+    _write_local_screening_audit(output_dir, {
+        "schema_version": SCREENING_LOCAL_VERSION,
+        "workflow_date": date.today().strftime("%Y%m%d"),
+        "as_of": expected_day,
+        "status": "ok",
+        "coverage": coverage,
+        "market": market_context,
+        "pool_stats": pool_stats,
+        "raw": len(candidates),
+        "selected": len(selected),
+        "candidates": audit_rows,
+    })
+    logger.info(
+        f"候选池本地精筛完成: 原始{len(candidates)}条 入选{len(selected)}条 "
+        f"K线覆盖{coverage:.0%} 市场={market_context.get('regime')}"
+    )
+    return selected
+
+
+_ANNOUNCEMENT_RISK_RULES = (
+    ("high", 8.0, ("立案调查", "退市风险警示", "终止上市", "财务造假", "重大违法", "债务逾期")),
+    ("medium", 4.0, ("减持计划", "股东减持", "限售股解禁", "监管问询", "业绩预亏", "业绩大幅下降", "行政处罚", "重大诉讼")),
+    ("low", 2.0, ("业绩下滑", "股权质押", "收到警示函", "诉讼仲裁")),
+)
+_ANNOUNCEMENT_NEGATED_PHRASES = (
+    "终止减持", "不减持", "承诺不减持", "撤销退市风险警示", "撤回诉讼", "解除质押",
+)
+
+
+def apply_announcement_risk_penalties(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Apply bounded, evidence-linked announcement penalties after news prefetch."""
+    if not candidates:
+        return {"status": "empty", "total": 0}
+    try:
+        from stock_selection_debate.data_fetcher import _load_debate_data_cache
+        cache = _load_debate_data_cache()
+    except Exception as exc:
+        logger.warning(f"公告风险缓存读取失败: {exc}")
+        cache = {}
+
+    today = date.today().strftime("%Y%m%d")
+    audit_rows: List[Dict[str, Any]] = []
+    counts = {"flagged": 0, "clear": 0, "unknown": 0, "unverified": 0}
+    for candidate in candidates:
+        stock = str(candidate.get("stock") or "").zfill(6)
+        name = str(candidate.get("name") or "").strip()
+        cached = cache.get(stock, {}) if isinstance(cache.get(stock, {}), dict) else {}
+        news = cached.get("news") if isinstance(cached.get("news"), list) else []
+        contract = ((cached.get("data_contract") or {}).get("news") or {}) if isinstance(cached.get("data_contract"), dict) else {}
+        checked_at = str(contract.get("checked_at") or cached.get("updated") or "")
+        contract_status = str(contract.get("status") or "")
+        base_score = _safe_float(candidate.get("pre_announcement_pool_score"))
+        if base_score is None:
+            base_score = _safe_float(candidate.get("pool_score")) or 0.0
+            candidate["pre_announcement_pool_score"] = round(base_score, 2)
+
+        matches: List[Dict[str, Any]] = []
+        unverified_hits = 0
+        for article in news:
+            if not isinstance(article, dict):
+                continue
+            title = str(article.get("title") or "").strip()
+            content = str(article.get("content") or "").strip()
+            text = f"{title} {content}"
+            if any(phrase in text for phrase in _ANNOUNCEMENT_NEGATED_PHRASES):
+                continue
+            identity_ok = bool(stock in text or (len(name) >= 2 and name in text))
+            for severity, penalty, keywords in _ANNOUNCEMENT_RISK_RULES:
+                keyword = next((word for word in keywords if word in text), "")
+                if not keyword:
+                    continue
+                article_day = _compact_screening_date(article.get("time"))
+                try:
+                    article_age = (date.today() - datetime.datetime.strptime(article_day, "%Y%m%d").date()).days
+                except (TypeError, ValueError):
+                    article_age = None
+                if article_age is None or article_age < 0 or article_age > 7:
+                    unverified_hits += 1
+                    continue
+                if not identity_ok:
+                    unverified_hits += 1
+                    continue
+                matches.append({
+                    "severity": severity,
+                    "penalty": penalty,
+                    "keyword": keyword,
+                    "title": title[:100],
+                    "time": str(article.get("time") or "")[:20],
+                    "source": str(article.get("source") or "")[:40],
+                })
+
+        severity_order = {"high": 3, "medium": 2, "low": 1}
+        matches.sort(key=lambda row: -severity_order.get(str(row.get("severity")), 0))
+        if matches:
+            status = "flagged"
+            severity = str(matches[0]["severity"])
+            penalty = float(matches[0]["penalty"])
+        elif checked_at == today and (news or contract_status in {"ok", "checked_fresh_no_recent_items"}):
+            status = "clear"
+            severity = "none"
+            penalty = 0.0
+        elif unverified_hits:
+            status = "unverified"
+            severity = "unknown"
+            penalty = 0.0
+        else:
+            status = "unknown"
+            severity = "unknown"
+            penalty = 0.0
+
+        counts[status] += 1
+        candidate["pool_score"] = round(max(0.0, base_score - penalty), 2)
+        risk = {
+            "version": ANNOUNCEMENT_RISK_VERSION,
+            "status": status,
+            "severity": severity,
+            "penalty": penalty,
+            "checked_at": checked_at,
+            "news_contract_status": contract_status or "missing",
+            "matches": matches[:3],
+            "unverified_hits": unverified_hits,
+        }
+        candidate["announcement_risk"] = risk
+        detail = dict(candidate.get("pool_score_detail") or {})
+        detail["announcement_risk_penalty"] = -penalty
+        candidate["pool_score_detail"] = detail
+        flags = [
+            flag for flag in (candidate.get("data_quality_flags") or [])
+            if flag not in {"ANNOUNCEMENT_RISK_UNKNOWN", "ANNOUNCEMENT_RISK_UNVERIFIED"}
+        ]
+        if status == "unknown":
+            flags.append("ANNOUNCEMENT_RISK_UNKNOWN")
+        elif status == "unverified":
+            flags.append("ANNOUNCEMENT_RISK_UNVERIFIED")
+        candidate["data_quality_flags"] = list(dict.fromkeys(flags))
+        audit_rows.append({
+            "stock": stock,
+            "name": name,
+            "pool": candidate.get("pool"),
+            "base_score": round(base_score, 2),
+            "final_score": candidate.get("pool_score"),
+            "risk": risk,
+        })
+
+    payload = {
+        "schema_version": ANNOUNCEMENT_RISK_VERSION,
+        "workflow_date": today,
+        "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "summary": {"total": len(candidates), **counts},
+        "candidates": audit_rows,
+    }
+    try:
+        target_dir = BASE_DIR / "output" / "xuangu"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for target in (
+            target_dir / f"announcement_risk_{today}.json",
+            target_dir / "announcement_risk_latest.json",
+        ):
+            tmp = target.with_suffix(target.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(target)
+    except Exception as exc:
+        logger.warning(f"公告风险审计保存失败: {exc}")
+    logger.info(
+        f"公告风险软校验完成: 风险{counts['flagged']} 清晰{counts['clear']} "
+        f"未知{counts['unknown']} 待核实{counts['unverified']}"
+    )
+    return payload["summary"]
+
+
+def _build_hot_sector_candidates(board_df, detail_loader, cfg: Dict) -> tuple[List[Dict], Dict]:
+    """Build a causal hot-sector pool from sector breadth and constituent quotes."""
+    sector_count = max(1, int(cfg.get("sector_count", 3)))
+    breadth_min = float(cfg.get("sector_breadth_min", 0.60))
+    per_sector = max(1, int(cfg.get("sector_stock_top_n", 5)))
+    top_n = max(1, int(cfg.get("top_n", XUANGU_POOL_TOP_N)))
+    sector_rows = []
+    for _, raw in board_df.iterrows():
+        sector_change = _safe_float(raw.get("涨跌幅"))
+        label = str(raw.get("label") or "").strip()
+        name = str(raw.get("板块") or "").strip()
+        if label and name and sector_change is not None and sector_change > 0:
+            sector_rows.append((sector_change, label, name, raw))
+    sector_rows.sort(key=lambda x: -x[0])
+
+    chosen_sectors: List[Dict[str, Any]] = []
+    selected_rows: List[Dict[str, Any]] = []
+    constituent_total = 0
+    eligible_total = 0
+    for sector_change, label, sector_name, raw_sector in sector_rows:
+        try:
+            detail_df = detail_loader(label)
+        except Exception as exc:
+            logger.warning(f"热点龙头板块成分获取失败 {sector_name}: {exc}")
+            continue
+        if detail_df is None or getattr(detail_df, "empty", True):
+            continue
+        changes = [
+            value for value in (_safe_float(x) for x in detail_df.get("changepercent", []))
+            if value is not None
+        ]
+        if not changes:
+            continue
+        breadth = sum(1 for value in changes if value > 0) / len(changes)
+        if breadth + 1e-9 < breadth_min:
+            continue
+
+        eligible = []
+        constituent_total += len(detail_df)
+        for _, row in detail_df.iterrows():
+            code = _normalize_stock_code(row.get("code") or row.get("symbol"))
+            name = str(row.get("name") or "").strip()
+            if not code or _is_bj_stock_code(code) or "ST" in name.upper() or "退" in name:
+                continue
+            change = _safe_float(row.get("changepercent"))
+            turnover = _safe_float(row.get("turnoverratio"))
+            amount = _safe_float(row.get("amount"))
+            close = _safe_price(row.get("trade"))
+            high = _safe_price(row.get("high"))
+            if None in (change, turnover, amount, close, high) or not high or high <= 0:
+                continue
+            max_gain = 15.0 if code.startswith(("300", "301", "688", "689")) else 9.5
+            if not (2.0 <= change <= max_gain):
+                continue
+            if not (1.5 <= turnover <= 15.0) or amount < 100000000.0:
+                continue
+            close_near_high = close / high
+            if close_near_high < 0.97:
+                continue
+
+            sector_points = min(12.0, max(0.0, sector_change / 5.0 * 12.0))
+            breadth_points = 8.0 + min(7.0, max(0.0, (breadth - breadth_min) / max(0.01, 1.0 - breadth_min) * 7.0))
+            momentum_points = _range_score(change, 2.0, min(8.0, max_gain), 18.0, floor=0.0, ceiling=max_gain)
+            amount_points = _cap_score(amount, 4000000000.0, 20.0)
+            turnover_points = _range_score(turnover, 2.0, 12.0, 12.0, floor=1.0, ceiling=20.0)
+            close_points = _range_score(close_near_high, 0.97, 1.005, 13.0, floor=0.94, ceiling=1.03)
+            score = round(min(100.0, 10.0 + sector_points + breadth_points + momentum_points + amount_points + turnover_points + close_points), 2)
+            eligible.append({
+                "stock": code,
+                "name": name,
+                "sector": sector_name,
+                "sector_change_pct": round(sector_change, 2),
+                "sector_breadth_pct": round(breadth * 100.0, 2),
+                "change_pct": round(change, 2),
+                "turnover_pct": round(turnover, 2),
+                "amount": round(amount, 2),
+                "close_near_high": round(close_near_high, 4),
+                "pool_score": score,
+                "pool_score_detail": {
+                    "sector_momentum": round(sector_points, 2),
+                    "sector_breadth": round(breadth_points, 2),
+                    "stock_momentum": round(momentum_points, 2),
+                    "amount": round(amount_points, 2),
+                    "turnover": round(turnover_points, 2),
+                    "close_near_high": round(close_points, 2),
+                },
+            })
+        eligible.sort(key=lambda x: (-float(x["amount"]), -float(x["pool_score"])))
+        picked = eligible[:per_sector]
+        for sector_rank, item in enumerate(picked, 1):
+            item["sector_rank"] = sector_rank
+        eligible_total += len(eligible)
+        selected_rows.extend(picked)
+        chosen_sectors.append({
+            "name": sector_name,
+            "label": label,
+            "change_pct": round(sector_change, 2),
+            "breadth_pct": round(breadth * 100.0, 2),
+            "constituents": len(detail_df),
+            "eligible": len(eligible),
+            "selected": len(picked),
+        })
+        if len(chosen_sectors) >= sector_count:
+            break
+
+    selected_rows.sort(key=lambda x: (-float(x["pool_score"]), -float(x["amount"])))
+    selected_rows = selected_rows[:top_n]
+    candidates = []
+    for rank, row in enumerate(selected_rows, 1):
+        reason = (
+            f"[{cfg['pool']}] {row['sector']}涨{row['sector_change_pct']:.2f}% "
+            f"上涨家数{row['sector_breadth_pct']:.0f}% 池内排名{rank}"
+        )
+        candidates.append({
+            "stock": row["stock"],
+            "name": row["name"],
+            "sector": row["sector"],
+            "reason": reason,
+            "source": "akshare_sector_local",
+            "pool": cfg["pool"],
+            "screen_id": cfg["screen_id"],
+            "query": cfg["query"],
+            "strategy_type": cfg["strategy_type"],
+            "entry_bias": cfg["entry_bias"],
+            "priority": cfg.get("priority", 99),
+            "pool_score": row["pool_score"],
+            "pool_rank": rank,
+            "pool_score_detail": row["pool_score_detail"],
+            "amount": row["amount"],
+            "sector_rank": row.get("sector_rank"),
+            "pool_total_candidates": constituent_total,
+            "pool_scored_candidates": eligible_total,
+            "sector_strength": {
+                "change_pct": row["sector_change_pct"],
+                "breadth_pct": row["sector_breadth_pct"],
+                "source": "akshare_sina_sector",
+            },
+            "source_pools": [cfg["pool"]],
+            "source_queries": [cfg["query"]],
+            "source_reasons": [reason],
+            "screen_ids": [cfg["screen_id"]],
+            "strategy_types": [cfg["strategy_type"]],
+            "entry_biases": [cfg["entry_bias"]],
+        })
+    return candidates, {
+        "status": "ok",
+        "source": "akshare_sina_sector",
+        "sectors": chosen_sectors,
+        "raw": constituent_total,
+        "scored": eligible_total,
+        "selected": len(candidates),
+    }
+
+
+def _previous_screening_trading_day(day_key: str) -> str:
+    try:
+        cursor = datetime.datetime.strptime(day_key, "%Y%m%d").date() - timedelta(days=1)
+    except ValueError:
+        return ""
+    shared_dir = Path.home() / ".openclaw" / "agents" / "shared"
+    if shared_dir.exists() and str(shared_dir) not in sys.path:
+        sys.path.insert(0, str(shared_dir))
+    try:
+        from trading_calendar import is_a_share_trading_day
+    except Exception:
+        is_a_share_trading_day = None
+    for _ in range(12):
+        compact = cursor.strftime("%Y%m%d")
+        if (is_a_share_trading_day and is_a_share_trading_day(compact)) or (
+            is_a_share_trading_day is None and cursor.weekday() < 5
+        ):
+            return compact
+        cursor -= timedelta(days=1)
+    return ""
+
+
+def _apply_hot_sector_history(
+    candidates: List[Dict[str, Any]],
+    stats: Dict[str, Any],
+    output_dir: Path,
+    current_as_of: str,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Reward sectors that remain strong across consecutive completed trading days."""
+    history_file = output_dir / "hot_sector_history.json"
+    history: List[Dict[str, Any]] = []
+    try:
+        if history_file.exists():
+            payload = json.loads(history_file.read_text(encoding="utf-8"))
+            if payload.get("schema_version") == HOT_SECTOR_HISTORY_VERSION:
+                history = [item for item in (payload.get("history") or []) if isinstance(item, dict)]
+    except Exception as exc:
+        logger.warning(f"热点板块历史读取失败，将从今日重建: {exc}")
+        history = []
+
+    prior_by_day = {
+        str(item.get("as_of") or ""): item
+        for item in history
+        if str(item.get("as_of") or "") and str(item.get("as_of") or "") != current_as_of
+    }
+    for candidate in candidates:
+        sector = str(candidate.get("sector") or "").strip()
+        streak = 1 if sector else 0
+        expected = _previous_screening_trading_day(current_as_of)
+        while expected and expected in prior_by_day:
+            sectors = {str(value).strip() for value in (prior_by_day[expected].get("sectors") or []) if str(value).strip()}
+            if sector not in sectors:
+                break
+            streak += 1
+            expected = _previous_screening_trading_day(expected)
+        bonus = min(6.0, max(0.0, (streak - 1) * 2.0))
+        candidate["sector_persistence_days"] = streak
+        candidate["sector_history_bonus"] = bonus
+        if bonus:
+            candidate["pool_score"] = round(min(100.0, float(candidate.get("pool_score") or 0) + bonus), 2)
+            detail = dict(candidate.get("pool_score_detail") or {})
+            detail["sector_persistence"] = bonus
+            detail["sector_persistence_value"] = streak
+            candidate["pool_score_detail"] = detail
+
+    candidates.sort(
+        key=lambda item: (-float(item.get("pool_score") or 0), -float(item.get("amount") or 0))
+    )
+    for rank, candidate in enumerate(candidates, 1):
+        candidate["pool_rank"] = rank
+        candidate["reason"] = re.sub(
+            r"池内排名\d+",
+            f"池内排名{rank}",
+            str(candidate.get("reason") or ""),
+        )
+        if candidate.get("sector_persistence_days", 0) > 1:
+            candidate["reason"] = (
+                f"{candidate.get('reason', '')}；板块连续强势"
+                f"{candidate['sector_persistence_days']}个交易日"
+            )[:300]
+
+    current_sectors = [
+        str(item.get("name") or "").strip()
+        for item in (stats.get("sectors") or [])
+        if str(item.get("name") or "").strip()
+    ]
+    history = [item for item in history if str(item.get("as_of") or "") != current_as_of]
+    history.append({
+        "as_of": current_as_of,
+        "workflow_date": date.today().strftime("%Y%m%d"),
+        "sectors": current_sectors,
+        "sector_stats": stats.get("sectors") or [],
+    })
+    history.sort(key=lambda item: str(item.get("as_of") or ""))
+    history = history[-20:]
+    history_payload = {
+        "schema_version": HOT_SECTOR_HISTORY_VERSION,
+        "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "history": history,
+    }
+    history_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp = history_file.with_suffix(history_file.suffix + ".tmp")
+    tmp.write_text(json.dumps(history_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(history_file)
+    return candidates, {
+        "history_days": len(history),
+        "persistent_sectors": sorted({
+            str(item.get("sector") or "")
+            for item in candidates
+            if int(item.get("sector_persistence_days") or 0) > 1
+        }),
+    }
+
+
+def _run_hot_sector_screening(cfg: Dict, output_dir: Path) -> tuple[List[Dict], Dict]:
+    snapshot_file = output_dir / f"hot_sector_snapshot_{date.today().strftime('%Y%m%d')}.json"
+    snapshot_signature = _screening_signature()
+    if snapshot_file.exists():
+        try:
+            payload = json.loads(snapshot_file.read_text(encoding="utf-8"))
+            if (
+                payload.get("workflow_date") == date.today().strftime("%Y%m%d")
+                and payload.get("screening_signature") == snapshot_signature
+            ):
+                cached = payload.get("candidates") or []
+                stats = dict(payload.get("stats") or {})
+                stats["status"] = "cached"
+                return cached, stats
+        except Exception as exc:
+            logger.warning(f"热点龙头快照读取失败: {exc}")
+
+    now = datetime.datetime.now()
+    allow_intraday_test = os.getenv("XUANGU_ALLOW_INTRADAY_SECTOR_TEST", "0") == "1"
+    if (now.hour, now.minute) >= (9, 25) and not allow_intraday_test:
+        return [], {
+            "status": "unsafe_intraday_no_cache",
+            "error": "09:25后无盘前快照，拒绝把盘中板块数据混入选股早报",
+        }
+
+    try:
+        import akshare as ak
+        board_df = retry_call(
+            "热点龙头行业榜",
+            lambda: ak.stock_sector_spot(indicator="行业"),
+            retries=4,
+            base_delay=2,
+            throttle_key="akshare-sector",
+            min_interval=3.0,
+        )
+
+        def detail_loader(label: str):
+            return retry_call(
+                f"热点龙头成分 {label}",
+                lambda: ak.stock_sector_detail(sector=label),
+                retries=3,
+                base_delay=1.5,
+                throttle_key="akshare-sector-detail",
+                min_interval=1.5,
+            )
+
+        recall_cfg = dict(cfg)
+        recall_cfg["top_n"] = max(int(cfg.get("top_n", 15)), int(cfg.get("recall_n", 15)))
+        recall_cfg["sector_stock_top_n"] = max(
+            int(cfg.get("sector_stock_top_n", 5)),
+            int(cfg.get("sector_stock_recall_n", cfg.get("sector_stock_top_n", 5))),
+        )
+        candidates, stats = _build_hot_sector_candidates(board_df, detail_loader, recall_cfg)
+        current_as_of = _last_completed_trading_day()
+        candidates, history_summary = _apply_hot_sector_history(
+            candidates,
+            stats,
+            output_dir,
+            current_as_of,
+        )
+        stats["history"] = history_summary
+        stats["selected"] = len(candidates)
+        payload = {
+            "schema_version": "hot-sector-v2-history",
+            "workflow_date": date.today().strftime("%Y%m%d"),
+            "as_of": current_as_of,
+            "generated_at": now.isoformat(timespec="seconds"),
+            "screening_signature": snapshot_signature,
+            "candidates": candidates,
+            "stats": stats,
+        }
+        snapshot_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = snapshot_file.with_suffix(snapshot_file.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(snapshot_file)
+        return candidates, stats
+    except Exception as exc:
+        logger.warning(f"热点龙头本地两阶段筛选失败: {exc}")
+        return [], {"status": "failed", "error": str(exc)[:300]}
+
+
 def _source_list(candidate: Dict, key: str, fallback_key: str = None) -> List[str]:
     value = candidate.get(key)
     if isinstance(value, list):
@@ -2292,6 +3589,19 @@ def _merge_candidate_sources(candidates: List[Dict]) -> List[Dict]:
         for value in values:
             if value and value not in target:
                 target.append(value)
+
+    def source_relative_score(record: Dict) -> float:
+        try:
+            score = float(record.get("score") or record.get("pool_score") or 0)
+        except (TypeError, ValueError):
+            score = 0.0
+        try:
+            rank = max(1, int(record.get("rank") or record.get("pool_rank") or 1))
+            total = max(rank, int(record.get("total") or record.get("pool_scored_candidates") or rank))
+            percentile = 100.0 * (total - rank + 1) / total
+        except (TypeError, ValueError):
+            percentile = score
+        return score * 0.7 + percentile * 0.3
 
     for c in candidates or []:
         stock = str(c.get("stock", "")).strip()
@@ -2339,6 +3649,17 @@ def _merge_candidate_sources(candidates: List[Dict]) -> List[Dict]:
             "reason": c.get("reason", ""),
             "pool_score": c.get("pool_score"),
             "pool_rank": c.get("pool_rank"),
+            "pool_scored_candidates": c.get("pool_scored_candidates") or c.get("pool_total_candidates"),
+            "pool_score_detail": c.get("pool_score_detail", {}),
+            "query_pool_score": c.get("query_pool_score"),
+            "local_screening": c.get("local_screening"),
+            "screening_features": c.get("screening_features"),
+            "dynamic_pool_quota": c.get("dynamic_pool_quota"),
+            "data_quality_flags": c.get("data_quality_flags"),
+            "sector": c.get("sector"),
+            "sector_rank": c.get("sector_rank"),
+            "sector_persistence_days": c.get("sector_persistence_days"),
+            "sector_history_bonus": c.get("sector_history_bonus"),
         })
         if c.get("pool_score") not in (None, ""):
             item["_source_score_records"].append({
@@ -2346,6 +3667,7 @@ def _merge_candidate_sources(candidates: List[Dict]) -> List[Dict]:
                 "screen_id": c.get("screen_id", ""),
                 "score": c.get("pool_score"),
                 "rank": c.get("pool_rank"),
+                "total": c.get("pool_scored_candidates") or c.get("pool_total_candidates"),
                 "detail": c.get("pool_score_detail", {}),
             })
 
@@ -2353,7 +3675,10 @@ def _merge_candidate_sources(candidates: List[Dict]) -> List[Dict]:
         for data_key in (
             "_financial", "fundamental", "tech_data", "sector", "pe", "yesterday_chg",
             "pool_score", "pool_rank", "pool_score_detail", "pool_total_candidates",
-            "pool_scored_candidates",
+            "pool_scored_candidates", "query_pool_score", "local_screening",
+            "screening_features", "dynamic_pool_quota", "sector_rank", "amount",
+            "sector_persistence_days", "sector_history_bonus", "data_quality_flags",
+            "announcement_risk",
         ):
             if c.get(data_key) not in (None, "", {}) and item.get(data_key) in (None, "", {}):
                 item[data_key] = c.get(data_key)
@@ -2364,7 +3689,23 @@ def _merge_candidate_sources(candidates: List[Dict]) -> List[Dict]:
         priorities = item.pop("_source_priorities", []) or [99]
         source_records = item.pop("_source_records", []) or []
         score_records = item.pop("_source_score_records", []) or []
-        primary = min(source_records, key=lambda x: x.get("priority", 99)) if source_records else {}
+        for record in source_records:
+            try:
+                score = float(record.get("pool_score") or 0)
+            except (TypeError, ValueError):
+                score = 0.0
+            try:
+                rank = max(1, int(record.get("pool_rank") or 1))
+                total = max(rank, int(record.get("pool_scored_candidates") or rank))
+                percentile = 100.0 * (total - rank + 1) / total
+            except (TypeError, ValueError):
+                percentile = score
+            record["pool_percentile"] = round(percentile, 2)
+            record["relative_score"] = round(score * 0.7 + percentile * 0.3, 2)
+        primary = max(
+            source_records,
+            key=lambda x: (float(x.get("relative_score") or 0), float(x.get("pool_score") or 0)),
+        ) if source_records else {}
         if primary.get("pool"):
             item["pool"] = primary.get("pool")
         if primary.get("screen_id"):
@@ -2377,17 +3718,35 @@ def _merge_candidate_sources(candidates: List[Dict]) -> List[Dict]:
             item["query"] = primary.get("query")
         if primary.get("reason"):
             item["reason"] = primary.get("reason")
-        if primary.get("pool_score") not in (None, ""):
-            item["pool_score"] = primary.get("pool_score")
+        for primary_key in (
+            "query_pool_score", "local_screening", "screening_features", "dynamic_pool_quota",
+            "data_quality_flags", "sector", "sector_rank", "sector_persistence_days",
+            "sector_history_bonus",
+        ):
+            if primary.get(primary_key) not in (None, "", {}, []):
+                item[primary_key] = primary.get(primary_key)
+        ranked_source_records = sorted(
+            source_records,
+            key=lambda x: (-float(x.get("relative_score") or 0), int(x.get("priority", 99))),
+        )
+        if ranked_source_records:
+            top_scores = [float(x.get("relative_score") or 0) for x in ranked_source_records[:2]]
+            item["pool_score"] = round(
+                top_scores[0] if len(top_scores) == 1 else top_scores[0] * 0.85 + top_scores[1] * 0.15,
+                2,
+            )
+            item["pool_score_detail"] = {
+                "method": "cross_pool_relative_top2",
+                "primary_raw_score": primary.get("pool_score"),
+                "primary_percentile": primary.get("pool_percentile"),
+                "primary_detail": primary.get("pool_score_detail", {}),
+            }
         if primary.get("pool_rank") not in (None, ""):
             item["pool_rank"] = primary.get("pool_rank")
         item["priority"] = min(priorities)
         item["source_score_records"] = sorted(
             score_records,
-            key=lambda x: (
-                999999 if x.get("rank") in (None, "") else int(x.get("rank", 999999)),
-                -float(x.get("score") or 0),
-            ),
+            key=lambda x: -source_relative_score(x),
         )
         item["screening_reason"] = "；".join(item.get("source_reasons") or [])[:300]
         result.append(item)
@@ -2768,7 +4127,11 @@ class CandidateGenerator:
             with open(csv_file, encoding="utf-8-sig") as f:
                 reader = csv.DictReader(f)
                 rows = list(reader)
-                ranked_rows, stats = _rank_xuangu_rows_for_pool(rows, cfg, XUANGU_POOL_TOP_N)
+                recall_n = max(
+                    int(cfg.get("top_n", XUANGU_POOL_TOP_N)),
+                    int(cfg.get("recall_n", cfg.get("top_n", XUANGU_POOL_TOP_N))),
+                )
+                ranked_rows, stats = _rank_xuangu_rows_for_pool(rows, cfg, recall_n)
                 for row in ranked_rows:
                     stock = _normalize_stock_code(row.get("股票代码") or row.get("代码"))
                     name = row.get("股票名称") or row.get("名称") or ""
@@ -2803,6 +4166,25 @@ class CandidateGenerator:
         for cfg in self.screening_configs:
             query = cfg["query"]
             pool = cfg["pool"]
+            fallback_reason_prefix = ""
+            fallback_source = "xuangu"
+            if cfg.get("screen_mode") == "local_hot_sector":
+                local_candidates, local_stats = _run_hot_sector_screening(cfg, xuangu_output)
+                if local_stats.get("status") in {"ok", "cached"}:
+                    results.extend(local_candidates)
+                    logger.info(
+                        f"选股 [{pool}] 本地两阶段完成: "
+                        f"板块{len(local_stats.get('sectors') or [])}个 "
+                        f"有效{local_stats.get('scored', 0)}只 入选{local_stats.get('selected', 0)}只"
+                    )
+                    continue
+                logger.warning(
+                    f"选股 [{pool}] 本地两阶段不可用，使用宽口径mx-xuangu兜底: "
+                    f"{local_stats.get('status')} {local_stats.get('error', '')}"
+                )
+                fallback_status = str(local_stats.get("status") or "unknown")
+                fallback_reason_prefix = f"[热点板块本地筛选不可用:{fallback_status}]"
+                fallback_source = "xuangu_hot_sector_fallback"
             xuangu_success = False
             for attempt in range(3):
                 try:
@@ -2834,7 +4216,17 @@ class CandidateGenerator:
                 csv_fallback = _latest_csv_for_query(query)
                 if csv_fallback:
                     try:
-                        stats = _read_rows(csv_fallback, cfg, source="xuangu_csv_cache", reason_prefix="[CSV缓存]")
+                        cache_source = (
+                            "xuangu_hot_sector_csv_fallback"
+                            if fallback_source == "xuangu_hot_sector_fallback"
+                            else "xuangu_csv_cache"
+                        )
+                        stats = _read_rows(
+                            csv_fallback,
+                            cfg,
+                            source=cache_source,
+                            reason_prefix=f"{fallback_reason_prefix}[CSV缓存]",
+                        )
                         if stats.get("selected", 0) > 0:
                             logger.warning(f"选股 [{pool}] API失败，使用CSV缓存兜底: {csv_fallback.name}")
                         else:
@@ -2860,7 +4252,12 @@ class CandidateGenerator:
                     csv_file = matches[-1] if matches else csv_file
                 if csv_file.exists():
                     try:
-                        stats = _read_rows(csv_file, cfg)
+                        stats = _read_rows(
+                            csv_file,
+                            cfg,
+                            source=fallback_source,
+                            reason_prefix=fallback_reason_prefix,
+                        )
                         logger.info(
                             f"选股 [{pool}] 池内评分: 原始{stats.get('raw', 0)}条 "
                             f"扫描{stats.get('scanned', 0)}条 过滤{stats.get('filtered', 0)}条 "
@@ -2872,8 +4269,16 @@ class CandidateGenerator:
                     logger.warning(f"选股 [{pool}] 未找到CSV文件: {csv_file.name}")
             time.sleep(3)  # 避免mx-xuangu请求频率过高
 
-        merged = _merge_candidate_sources(results)
-        logger.info(f"选股候选合并: 原始{len(results)}条 → 去重{len(merged)}只")
+        refined = _refine_screening_candidates(
+            results,
+            self.screening_configs,
+            self.output_dir,
+        )
+        merged = _merge_candidate_sources(refined)
+        logger.info(
+            f"选股候选合并: 宽召回{len(results)}条 → 本地精筛{len(refined)}条 "
+            f"→ 去重{len(merged)}只"
+        )
         return merged
 
 def _xuangu_fallback_via_akshare(screen_cfg) -> List[Dict]:

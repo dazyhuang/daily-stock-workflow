@@ -29,16 +29,58 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Any, Optional
 from llm_scorer import _is_valid_tech_data, _build_financial_str
 from domestic_network import domestic_subprocess_env, retry_call
+from workflow_common import setup_file_logging, write_json_atomic
+from workflow_checkpoint import (
+    checkpoint_version_matches,
+    new_checkpoint_state,
+    refresh_checkpoint_metadata,
+)
 from stock_selection_debate.run_debate_phase import (
     run_debate_phase,
     debate_phase_to_phase2_format,
     _apply_pool_money_flow_seed,
     _apply_quant_confidence_overlay,
+    validate_and_repair_phase2_consistency,
+    SCORING_VERSION,
+    PROMPT_VERSION,
+    EDGE_RULE_VERSION,
+    TOP5_RULE_VERSION,
 )
+from stock_selection_debate.knowledge_rules import attach_knowledge_rules
+try:
+    from stock_selection_debate.market_snapshot import MARKET_SNAPSHOT_VERSION, attach_verified_market_snapshot
+except Exception:
+    MARKET_SNAPSHOT_VERSION = "unavailable"
+    attach_verified_market_snapshot = None
+try:
+    from stock_selection_debate.data_router import DATA_ROUTER_VERSION, attach_data_router_metadata
+except Exception:
+    DATA_ROUTER_VERSION = "unavailable"
+    attach_data_router_metadata = None
+try:
+    from stock_selection_debate.providers import LLM_RETRY_POLICY_VERSION
+except Exception:
+    LLM_RETRY_POLICY_VERSION = "unavailable"
+
 
 # ── 临时 logger（在Backtrader导入失败时用到）──────────────
 import logging
 _logger = logging.getLogger("daily_stock_workflow")
+
+
+def _workflow_version_meta(model: str = "", debate_rounds: str = "layered_1_top15_2") -> Dict[str, str]:
+    return {
+        "scoring_version": SCORING_VERSION,
+        "prompt_version": PROMPT_VERSION,
+        "edge_rule_version": EDGE_RULE_VERSION,
+        "top5_rule_version": TOP5_RULE_VERSION,
+        "market_snapshot_version": MARKET_SNAPSHOT_VERSION,
+        "data_router_version": DATA_ROUTER_VERSION,
+        "llm_retry_policy_version": LLM_RETRY_POLICY_VERSION,
+        "checkpoint_schema_version": "2026-07-10.node-state-v2",
+        "workflow_model": str(model or ""),
+        "debate_rounds": str(debate_rounds),
+    }
 
 # Backtrader Phase 3 回测引擎（可选，失败时降级到旧实现）
 try:
@@ -51,20 +93,299 @@ except Exception as e:
 
 # ── 路径设置 ──────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
-SKILLS_DIR = Path(os.environ.get("OPENCLAW_WORKSPACE", "./workspace")) / "skills"
+SKILLS_DIR = Path(os.environ.get("OPENCLAW_WORKSPACE", ".")) / "skills"
+XQ_HTTP_BASE = os.environ.get(
+    "QMT_HTTP_URL",
+    os.environ.get("XQSHARE_HTTP_BASE", "http://127.0.0.1:8080"),
+).rstrip("/")
 OUTPUT_DIR = BASE_DIR / "output"
-OUTPUT_DIR.mkdir(exist_ok=True)
 
-# ── 日志配置 ──────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.FileHandler(OUTPUT_DIR / f"workflow_{date.today().strftime('%Y%m%d')}.log"),
-        logging.StreamHandler()
-    ]
-)
+# ── 日志配置：显式初始化，避免 import 时写日志文件 ─────────────
 logger = logging.getLogger("daily_stock_workflow")
+_LOGGING_READY = False
+
+
+def setup_logging() -> logging.Logger:
+    global logger, _LOGGING_READY
+    if not _LOGGING_READY:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        logger = setup_file_logging(
+            logger_name="daily_stock_workflow",
+            log_dir=OUTPUT_DIR,
+            filename_prefix="workflow",
+        )
+        _LOGGING_READY = True
+    return logger
+
+
+
+
+def _shorten_text(value: Any, limit: int = 1200) -> Any:
+    if isinstance(value, str) and len(value) > limit:
+        return value[:limit] + "..."
+    return value
+
+
+def _compact_report_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    item = dict(candidate or {})
+    item.pop("kline_raw", None)
+    for key in ("bull_argument", "bear_argument", "bull_history", "bear_history", "debate_history", "research_plan", "raw_final_decision"):
+        if key in item:
+            item[key] = _shorten_text(item[key])
+    return item
+
+
+def _compact_ranked_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    keep = (
+        "stock", "name", "sector", "signal", "action", "buy_score", "confidence",
+        "position_ratio", "allow_direct_buy", "needs_intraday_confirmation",
+        "entry_condition", "block_buy_reason",
+        "ranking_score", "final_score", "top5_sort_score", "pre_edge_score",
+        "quant_base_score", "llm_buy_score", "llm_confidence", "llm_signal",
+        "llm_risk_adjustment", "pool", "source_pools", "screen_id", "screen_ids",
+        "strategy_type", "strategy_types", "pool_score", "pool_rank",
+        "pool_scored_candidates", "money_flow",
+        "kline_summary", "indicators", "rsi",
+        "data_quality_flags", "data_quality_score", "tradable_data_ok",
+        "missing_core_data", "data_freshness", "data_contract", "decision_models",
+        "decision_source", "reason", "execution_gate", "signal_blockers",
+        "historical_edge_score", "historical_edge_matches", "chase_risk_penalty",
+        "historical_weakness_penalty", "historical_weakness_matches",
+        "knowledge_rule_score_adjustment", "knowledge_rule_summary",
+        "knowledge_rule_watch_only", "knowledge_rule_hard_blocker",
+        "strategy_backtest", "selection_backtest", "tradingview_url", "scoring_version", "prompt_version",
+        "edge_rule_version", "top5_rule_version", "market_snapshot_version",
+        "data_router_version",
+        "pm_signal", "pm_score", "pm_confidence", "pm_reason", "final_reason",
+        "global_rank", "top5_selection_reason", "top5_effective_score",
+    )
+    compact = {
+        key: _shorten_text(candidate.get(key), 600)
+        for key in keep
+        if candidate.get(key) not in (None, "", [], {})
+    }
+    money_flow = candidate.get("money_flow") or {}
+    if isinstance(money_flow, dict):
+        compact["money_flow"] = {
+            key: money_flow.get(key)
+            for key in (
+                "main_net_flow", "super_net_flow", "ddx_5", "ddy_10",
+                "main_net_flow_5d", "main_net_flow_10d", "source", "as_of",
+            )
+            if money_flow.get(key) not in (None, "")
+        }
+    contract = candidate.get("data_contract") or {}
+    if isinstance(contract, dict):
+        compact_contract = {}
+        for category, item in contract.items():
+            if not isinstance(item, dict):
+                continue
+            compact_contract[category] = {
+                key: item.get(key)
+                for key in (
+                    "status", "source", "as_of", "checked_at", "content_as_of",
+                    "content_is_old", "is_stale", "quality_flags", "field_status",
+                )
+                if item.get(key) not in (None, "", [], {})
+            }
+        compact["data_contract"] = compact_contract
+    detail = candidate.get("quant_score_detail") or {}
+    if isinstance(detail, dict):
+        compact["quant_summary"] = {
+            key: detail.get(key)
+            for key in (
+                "tech_score", "pool_score", "money_flow_score", "next_day_buyability_score",
+                "data_quality_penalty", "pre_edge_score", "historical_edge_score",
+                "historical_weakness_penalty", "knowledge_rule_score_adjustment",
+                "chase_risk_penalty", "raw_signal_by_score", "final_signal",
+            )
+            if detail.get(key) not in (None, "", [], {})
+        }
+    for key in ("historical_edge_matches", "historical_weakness_matches"):
+        if isinstance(compact.get(key), list):
+            compact[key] = compact[key][:2]
+    return compact
+
+
+def _compact_daily_report(report: Dict[str, Any]) -> Dict[str, Any]:
+    compact = {k: v for k, v in report.items() if k not in {"phase1", "phase2"}}
+    compact["phase1"] = [
+        {
+            key: _shorten_text(item.get(key), 1800)
+            for key in ("name", "status", "color", "findings", "error", "elapsed", "data_contract")
+            if item.get(key) not in (None, "", [], {})
+        }
+        for item in (report.get("phase1") or [])
+        if isinstance(item, dict)
+    ]
+    phase2 = report.get("phase2") or {}
+    heavy_keys = {"ranked_candidates", "top_picks", "buy_list", "watch_list", "avoid_list", "candidates", "all_analysts", "debate_packets"}
+    compact_phase2 = {k: v for k, v in phase2.items() if k not in heavy_keys}
+    ranked = phase2.get("ranked_candidates") or []
+    compact_phase2["ranked_candidates"] = [_compact_ranked_candidate(x) for x in ranked if isinstance(x, dict)]
+    compact_phase2["top_picks"] = [_compact_ranked_candidate(x) for x in (phase2.get("top_picks") or []) if isinstance(x, dict)]
+    compact_phase2["signal_counts"] = {
+        signal: sum(1 for x in ranked if str(x.get("signal") or "").upper() == signal)
+        for signal in ("BUY", "WATCH", "AVOID", "MODEL_FAILED")
+    }
+    compact_phase2["candidate_count"] = len(ranked)
+    compact_phase2["candidate_details_artifact"] = (report.get("artifacts") or {}).get("candidates_jsonl", "")
+    compact_phase2["all_analysts"] = [
+        {
+            key: _shorten_text(item.get(key), 1200)
+            for key in ("name", "status", "color", "findings", "error", "elapsed")
+            if item.get(key) not in (None, "", [], {})
+        }
+        for item in (phase2.get("all_analysts") or [])
+        if isinstance(item, dict)
+    ]
+    compact["phase2"] = compact_phase2
+    compact["report_schema_version"] = "2026-07-17.compact-v2"
+    return _enforce_report_size_budget(compact)
+
+
+def _report_json_size(report: Dict[str, Any]) -> int:
+    return len(json.dumps(report, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _enforce_report_size_budget(report: Dict[str, Any], budget_bytes: int = 300 * 1024) -> Dict[str, Any]:
+    """Keep the main report small; complete candidate evidence lives in JSONL."""
+    size_before = _report_json_size(report)
+    phase2 = report.get("phase2") or {}
+    if size_before > budget_bytes:
+        for row in phase2.get("ranked_candidates") or []:
+            if not isinstance(row, dict):
+                continue
+            for key in (
+                "data_contract", "data_freshness", "kline_summary", "indicators", "money_flow",
+                "historical_edge_matches", "historical_weakness_matches", "quant_summary",
+            ):
+                row.pop(key, None)
+        for analyst in report.get("phase1") or []:
+            if isinstance(analyst, dict) and isinstance(analyst.get("findings"), str):
+                analyst["findings"] = _shorten_text(analyst["findings"], 700)
+    if _report_json_size(report) > budget_bytes:
+        minimal_keys = {
+            "stock", "name", "sector", "signal", "buy_score", "confidence", "global_rank",
+            "pm_signal", "pm_score", "pm_confidence", "final_reason", "reason", "pool",
+            "pool_score", "top5_sort_score", "execution_gate", "data_quality_flags",
+            "decision_models", "decision_source", "scoring_version", "top5_rule_version",
+        }
+        phase2["ranked_candidates"] = [
+            {key: row.get(key) for key in minimal_keys if row.get(key) not in (None, "", [], {})}
+            for row in (phase2.get("ranked_candidates") or [])
+            if isinstance(row, dict)
+        ]
+    report["storage_summary"] = {
+        "budget_bytes": budget_bytes,
+        "estimated_bytes": 0,
+        "candidate_details_artifact": phase2.get("candidate_details_artifact", ""),
+        "compacted": False,
+    }
+    final_size = _report_json_size(report)
+    if final_size > budget_bytes:
+        # Last-resort display compaction. Complete analyst/candidate evidence is
+        # already preserved in the split artifacts written before this step.
+        phase2["all_analysts"] = []
+        for analyst in report.get("phase1") or []:
+            if isinstance(analyst, dict) and isinstance(analyst.get("findings"), str):
+                analyst["findings"] = _shorten_text(analyst["findings"], 300)
+        summary = phase2.get("data_quality_summary") or {}
+        if isinstance(summary, dict):
+            summary.pop("affected", None)
+        final_size = _report_json_size(report)
+    report["storage_summary"]["estimated_bytes"] = final_size
+    report["storage_summary"]["compacted"] = size_before > final_size
+    return report
+
+
+def _write_daily_report_artifacts(report: Dict[str, Any], date_key: str) -> None:
+    phase2 = report.get("phase2") or {}
+    ranked = phase2.get("ranked_candidates") or []
+    candidates_path = OUTPUT_DIR / f"daily_candidates_{date_key}.jsonl"
+    candidates_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(candidates_path, "w", encoding="utf-8") as f:
+        for candidate in ranked:
+            f.write(json.dumps(_compact_report_candidate(candidate), ensure_ascii=False) + "\n")
+    trace = {
+        "date": report.get("date"),
+        "timestamp": report.get("timestamp"),
+        "top_picks": [_compact_ranked_candidate(x) for x in (phase2.get("top_picks") or []) if isinstance(x, dict)],
+        "version_summary": phase2.get("version_summary") or {},
+        "model_score_summary": phase2.get("model_score_summary") or {},
+        "data_quality_summary": phase2.get("data_quality_summary") or {},
+        "checkpoint_summary": phase2.get("checkpoint_summary") or {},
+        "sector_rotation": phase2.get("sector_rotation") or {},
+    }
+    trace_path = OUTPUT_DIR / f"daily_trace_{date_key}.json"
+    write_json_atomic(trace_path, trace, indent=2)
+    summary = {
+        "date": report.get("date"),
+        "timestamp": report.get("timestamp"),
+        "status": report.get("status"),
+        "failure_reason": report.get("failure_reason", ""),
+        "top_picks": [_compact_ranked_candidate(x) for x in (phase2.get("top_picks") or []) if isinstance(x, dict)],
+        "data_quality_summary": phase2.get("data_quality_summary") or {},
+        "model_score_summary": phase2.get("model_score_summary") or {},
+        "checkpoint_summary": phase2.get("checkpoint_summary") or {},
+        "version_summary": phase2.get("version_summary") or {},
+        "phase3_selection_summary": {
+            k: (report.get("phase3_selection") or {}).get(k)
+            for k in ("status", "avg_return_pct", "win_rate", "alpha_pct", "hs300_return_pct")
+        },
+        "phase3_strategy_summary": {
+            k: (report.get("phase3_strategy") or {}).get(k)
+            for k in ("status", "avg_return_pct", "total_return_pct", "portfolio_return_pct", "alpha_pct", "hs300_return_pct")
+        },
+    }
+    summary_path = OUTPUT_DIR / f"daily_report_summary_{date_key}.json"
+    write_json_atomic(summary_path, summary, indent=2)
+    report.setdefault("artifacts", {})["candidates_jsonl"] = str(candidates_path)
+    report.setdefault("artifacts", {})["trace_json"] = str(trace_path)
+    report.setdefault("artifacts", {})["summary_json"] = str(summary_path)
+
+def _refresh_debate_packet_metadata(packet: Dict[str, Any]) -> Dict[str, Any]:
+    if attach_data_router_metadata is not None:
+        try:
+            packet = attach_data_router_metadata(packet)
+        except Exception as exc:
+            logger.warning(f"数据路由合同刷新失败 {packet.get('stock_code')}: {exc}")
+    if attach_verified_market_snapshot is not None:
+        try:
+            packet = attach_verified_market_snapshot(packet)
+        except Exception as exc:
+            logger.warning(f"行情事实快照刷新失败 {packet.get('stock_code')}: {exc}")
+    return packet
+
+
+def _merge_candidate_financial(packet: Dict[str, Any], raw_financial: Any) -> None:
+    """把候选池旧财务字段归一后补进辩论包，不覆盖已有有效值。"""
+    if not isinstance(raw_financial, dict):
+        return
+    from stock_selection_debate.data_fetcher import normalize_financial_record
+
+    normalized = normalize_financial_record(raw_financial)
+    packet_financial = packet.setdefault("financial", {})
+    field_map = {
+        "roe_annual_latest": "roe",
+        "roe_quarter_latest": "roe_quarter",
+        "revenue_growth_yoy": "revenue_growth",
+        "net_profit_growth_yoy": "net_profit_growth",
+        "gross_margin": "gross_margin",
+        "pe_ttm": "pe_ttm",
+        "pb": "pb",
+        "debt_asset_ratio": "debt_ratio",
+        "total_market_cap": "market_cap",
+        "operating_cash_flow": "cash_flow",
+        "book_value_per_share": "book_value_per_share",
+    }
+    for source_field, packet_field in field_map.items():
+        value = normalized.get(source_field)
+        if value is not None and value != "" and packet_financial.get(packet_field) in (None, ""):
+            packet_financial[packet_field] = value
+    raw = dict(packet_financial.get("_fin_raw") or {})
+    raw.update(normalized)
+    packet_financial["_fin_raw"] = raw
 
 
 def _load_mx_data_class():
@@ -223,6 +544,23 @@ def _candidate_universe_signature(candidates: List[Dict[str, Any]], screening_si
     })
 
 
+def _split_layered_debate_packets(
+    debate_packets: List[Dict[str, Any]],
+    pending_packets: List[Dict[str, Any]],
+    shortlist_size: int = 15,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    shortlist_codes = {
+        str(packet.get("stock_code") or "")
+        for packet in sorted(
+            debate_packets,
+            key=lambda item: -float(item.get("pool_score") or 0),
+        )[:max(0, shortlist_size)]
+    }
+    two_round = [p for p in pending_packets if str(p.get("stock_code") or "") in shortlist_codes]
+    one_round = [p for p in pending_packets if str(p.get("stock_code") or "") not in shortlist_codes]
+    return two_round, one_round
+
+
 def _daily_push_marker_file() -> Path:
     return OUTPUT_DIR / f"daily_report_push_{date.today().strftime('%Y%m%d')}.json"
 
@@ -244,7 +582,7 @@ def _daily_report_already_pushed(report: Dict[str, Any]) -> bool:
     if data.get("date") != date.today().isoformat() or data.get("status") != "success":
         return False
     marker_digest = data.get("report_digest")
-    return bool(marker_digest) and marker_digest == _stable_digest(report)
+    return bool(marker_digest) and marker_digest == _stable_digest(_compact_daily_report(report))
 
 
 def _daily_report_failure_already_notified(reason: str) -> bool:
@@ -267,7 +605,10 @@ def _mark_daily_report_push_status(report: Dict[str, Any], status: str, **extra:
         "date": date.today().isoformat(),
         "status": status,
         "updated_at": datetime.now().isoformat(),
-        "report_digest": _stable_digest(report),
+        # The durable report is compacted before it is written.  Hash that
+        # exact representation so the stable launcher can verify push/report
+        # consistency after the workflow process exits.
+        "report_digest": _stable_digest(_compact_daily_report(report)),
         "top_picks_count": len(top_picks),
         "top_picks": [
             {
@@ -308,6 +649,10 @@ def check_env():
 
 def _phase1_context_file() -> Path:
     return OUTPUT_DIR / "phase1_context.json"
+
+
+def _phase1_candidates_file() -> Path:
+    return OUTPUT_DIR / "phase1_candidates.json"
 
 
 def _is_today_file(path: Path) -> bool:
@@ -360,6 +705,147 @@ def _load_phase1_context() -> List[Dict[str, Any]]:
     except Exception as e:
         logger.warning(f"Phase 1 上下文读取失败: {e}")
     return []
+
+
+def _save_phase1_candidates(gen: Any) -> None:
+    candidates = getattr(gen, "candidates", None)
+    if not isinstance(candidates, list) or not candidates:
+        return
+    path = _phase1_candidates_file()
+    payload = {
+        "date": date.today().strftime("%Y%m%d"),
+        "saved_at": datetime.now().isoformat(),
+        "screening_signature": str(getattr(gen, "screening_signature", "") or ""),
+        "candidates": candidates,
+    }
+    try:
+        write_json_atomic(path, payload, indent=2)
+        logger.info(f"Phase 1 候选池快照已保存: {len(candidates)} 只 -> {path}")
+    except Exception as e:
+        logger.warning(f"Phase 1 候选池快照保存失败: {e}")
+
+
+def _load_phase1_candidates() -> Dict[str, Any]:
+    path = _phase1_candidates_file()
+    if not path.exists() or not _is_today_file(path):
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return {}
+        if str(payload.get("date") or "") != date.today().strftime("%Y%m%d"):
+            return {}
+        candidates = payload.get("candidates") or []
+        if not isinstance(candidates, list) or not candidates:
+            return {}
+        try:
+            from llm_scorer import _screening_signature
+            current_signature = _screening_signature()
+        except Exception:
+            current_signature = ""
+        saved_signature = str(payload.get("screening_signature") or "")
+        if current_signature and saved_signature != current_signature:
+            logger.warning(
+                "Phase 1 候选池筛选版本已变化，忽略旧快照并重新生成: "
+                f"{saved_signature or '(missing)'} -> {current_signature}"
+            )
+            return {}
+        logger.info(f"Resume 模式：已恢复 Phase 1 候选池快照 {len(candidates)} 只")
+        return payload
+    except Exception as e:
+        logger.warning(f"Phase 1 候选池快照读取失败: {e}")
+        return {}
+
+
+def _today_debate_checkpoint_available() -> bool:
+    path = OUTPUT_DIR / "debate_checkpoint.json"
+    if not path.exists() or not _is_today_file(path):
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("date") != date.today().strftime("%Y%m%d"):
+            return False
+        try:
+            from llm_scorer import _screening_signature
+            expected_signature = _screening_signature()
+        except Exception:
+            expected_signature = ""
+        return not expected_signature or str(payload.get("screening_signature") or "") == expected_signature
+    except Exception:
+        return False
+
+
+_INVALID_NODE_CHECKPOINT_MARKERS = (
+    "证据校验未通过，本轮论据不计入后续裁决",
+    "模型失败/待重试",
+    "MODEL_FAILED",
+)
+
+
+def _node_checkpoint_state_reusable(state_snapshot: Any) -> bool:
+    if not isinstance(state_snapshot, dict) or not state_snapshot:
+        return False
+    try:
+        serialized = json.dumps(state_snapshot, ensure_ascii=False, default=str)
+    except Exception:
+        serialized = str(state_snapshot)
+    return not any(marker in serialized for marker in _INVALID_NODE_CHECKPOINT_MARKERS)
+
+
+def _node_checkpoint_entry_reusable(node_key: Any, state_snapshot: Any) -> bool:
+    key = str(node_key or "")
+    if key.endswith(".tech") and ".research_manager." not in key:
+        return False
+    return _node_checkpoint_state_reusable(state_snapshot)
+
+
+def _node_checkpoint_evidence_errors(
+    packet: Optional[Dict[str, Any]],
+    state_snapshot: Any,
+) -> List[str]:
+    if not isinstance(packet, dict) or not isinstance(state_snapshot, dict):
+        return []
+    errors: List[str] = []
+    evidence_validation = state_snapshot.get("evidence_validation")
+    if isinstance(evidence_validation, dict) and evidence_validation.get("status") == "fail":
+        details = evidence_validation.get("errors") or []
+        suffix = f":{'/'.join(str(item) for item in details[:3])}" if details else ""
+        errors.append(f"基金经理证据校验状态失败{suffix}")
+    response = str(state_snapshot.get("current_response") or "").strip()
+    if not response:
+        return errors
+    try:
+        from stock_selection_debate.debate_engine import _role_evidence_errors, _role_evidence_packet
+        validation_state = {"debate_packet": packet}
+        for key in (
+            "tech_pattern_score",
+            "tech_raw_score",
+            "tech_max_score",
+            "tech_rule_signal",
+            "tech_veto_reasons",
+        ):
+            if key in state_snapshot:
+                validation_state[key] = state_snapshot.get(key)
+        errors.extend(_role_evidence_errors(_role_evidence_packet(validation_state), response))
+        return errors
+    except Exception:
+        return errors
+
+
+def _prefetch_phase2_candidates(candidates: List[Dict[str, Any]]) -> None:
+    if not candidates:
+        return
+    logger.info(f"Phase 2 数据预获取即将开始: {len(candidates)} 只候选股")
+    try:
+        from stock_selection_debate.data_fetcher import _prefetch_debate_data
+        _prefetch_debate_data(candidates)
+    except Exception as e:
+        logger.warning(f"辩论数据预获取失败: {e}")
+    try:
+        from llm_scorer import apply_announcement_risk_penalties
+        apply_announcement_risk_penalties(candidates)
+    except Exception as e:
+        logger.warning(f"公告风险软校验失败，不阻断辩论: {e}")
 
 
 def _ensure_resume_market_context(phase1_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -469,7 +955,7 @@ def _get_stock_hist_prices_mx(stock_code: str, days: int = 20) -> Optional[list]
             ".SZ" if stock_code.startswith(("00", "30")) else
             ".SH"
         )
-        url = f"http://127.0.0.1:8080/market_data3?stock={stock_code}{suffix}&period=1d&count={days * 2}"
+        url = f"{XQ_HTTP_BASE}/market_data3?stock={stock_code}{suffix}&period=1d&count={days * 2}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             raw = json.loads(resp.read().decode())
@@ -671,7 +1157,7 @@ class TechnicalAnalyst(Analyst):
                     # 优先用 QMT HTTP API（支持指数）
                     import urllib.request, json as _json
                     suffix = ".SZ" if code.startswith(("00", "30")) else ".SH"
-                    url = f"http://127.0.0.1:8080/market_data3?stock={code}{suffix}&period=1d&count=20"
+                    url = f"{XQ_HTTP_BASE}/market_data3?stock={code}{suffix}&period=1d&count=20"
                     try:
                         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
                         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -1640,7 +2126,7 @@ def run_phase2_debate(analyst_results: List[Dict[str, Any]], gen=None, dry_run: 
         try:
             import urllib.request, json
             full_code = _ensure_suffix(stock)
-            url = f"http://127.0.0.1:8080/market_data3?stock={full_code}&period=1d&count=20"
+            url = f"{XQ_HTTP_BASE}/market_data3?stock={full_code}&period=1d&count=20"
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with _retry(f"K线(HTTP) {stock}", lambda: urllib.request.urlopen(req, timeout=15)) as resp:
                 raw = resp.read().decode("utf-8")
@@ -1652,7 +2138,7 @@ def run_phase2_debate(analyst_results: List[Dict[str, Any]], gen=None, dry_run: 
                     logger.info(f"K线(HTTP) {stock} 本地最新={latest_date}, 期望={expected_td}")
                     if latest_date == expected_td:
                         # 本地已是最新，获取完整120条
-                        url120 = f"http://127.0.0.1:8080/market_data3?stock={full_code}&period=1d&count=120"
+                        url120 = f"{XQ_HTTP_BASE}/market_data3?stock={full_code}&period=1d&count=120"
                         req120 = urllib.request.Request(url120, headers={"User-Agent": "Mozilla/5.0"})
                         with _retry(f"K线(HTTP120) {stock}", lambda: urllib.request.urlopen(req120, timeout=15)) as resp:
                             raw120 = resp.read().decode("utf-8")
@@ -1886,23 +2372,24 @@ def run_phase2_debate(analyst_results: List[Dict[str, Any]], gen=None, dry_run: 
         current_candidate_signature = cp_candidate_sig
     candidate_sig_ok = cp_candidate_sig == current_candidate_signature
     old_cp_has_results = bool(cp.get("completed") or cp.get("results"))
+    version_sig_ok = checkpoint_version_matches(cp, _workflow_version_meta(model=model))
     if old_cp_has_results and (
         (current_screening_signature and cp_sig != current_screening_signature)
         or not candidate_sig_ok
+        or not version_sig_ok
     ):
         logger.warning(
             f"Checkpoint 签名变化 screening {cp_sig or '(missing)'} -> {current_screening_signature or '(missing)'}, "
-            f"candidates {cp_candidate_sig[:12] or '(missing)'} -> {current_candidate_signature[:12]}，清空旧辩论结果"
+            f"candidates {cp_candidate_sig[:12] or '(missing)'} -> {current_candidate_signature[:12]}, "
+            f"version_ok={version_sig_ok}，清空旧辩论结果"
         )
-        cp = {
-            "date": date.today().strftime("%Y%m%d"),
-            "completed": [],
-            "failed": [],
-            "results": {},
-            "candidates": _checkpoint_candidate_snapshot(candidates),
-            "screening_signature": current_screening_signature,
-            "candidate_signature": current_candidate_signature,
-        }
+        cp = new_checkpoint_state(
+            trading_day=date.today().strftime("%Y%m%d"),
+            candidates=_checkpoint_candidate_snapshot(candidates),
+            screening_signature=current_screening_signature,
+            candidate_signature=current_candidate_signature,
+            version_meta=_workflow_version_meta(model=model),
+        )
         try:
             with _exclusive_file_lock(cp_lock_file):
                 tmp = cp_file.with_name(f"{cp_file.name}.{os.getpid()}.tmp")
@@ -1919,15 +2406,55 @@ def run_phase2_debate(analyst_results: List[Dict[str, Any]], gen=None, dry_run: 
 
     def _save_outer_checkpoint(current_cp: Dict[str, Any]) -> None:
         with _exclusive_file_lock(cp_lock_file):
-            current_cp["date"] = date.today().strftime("%Y%m%d")
-            current_cp["screening_signature"] = current_screening_signature
-            current_cp["candidate_signature"] = current_candidate_signature
-            current_cp["candidates"] = _checkpoint_candidate_snapshot(candidates)
+            refresh_checkpoint_metadata(
+                current_cp,
+                trading_day=date.today().strftime("%Y%m%d"),
+                candidates=_checkpoint_candidate_snapshot(candidates),
+                screening_signature=current_screening_signature,
+                candidate_signature=current_candidate_signature,
+                version_meta=_workflow_version_meta(model=model),
+            )
             tmp = cp_file.with_name(f"{cp_file.name}.{os.getpid()}.outer.tmp")
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(current_cp, f, ensure_ascii=False)
                 f.flush()
             tmp.replace(cp_file)
+
+    def _load_outer_checkpoint() -> Dict[str, Any]:
+        with _exclusive_file_lock(cp_lock_file):
+            try:
+                current = json.loads(cp_file.read_text(encoding="utf-8"))
+            except Exception:
+                return cp if isinstance(cp, dict) else {}
+        return current if isinstance(current, dict) else {}
+
+    def _completed_node_evidence_failures(
+        code: str,
+        packet: Optional[Dict[str, Any]],
+    ) -> Dict[str, List[str]]:
+        """Revalidate completed stocks when the evidence contract evolves."""
+        path = OUTPUT_DIR / "debate_node_checkpoints" / date.today().strftime("%Y%m%d") / f"{code}.json"
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        if (
+            payload.get("date") != date.today().strftime("%Y%m%d")
+            or payload.get("candidate_signature") != current_candidate_signature
+            or payload.get("version_meta") != _workflow_version_meta(model=model)
+        ):
+            return {}
+        nodes = payload.get("nodes") or {}
+        if not isinstance(nodes, dict):
+            return {}
+        return {
+            key: errors
+            for key, value in nodes.items()
+            if _node_checkpoint_entry_reusable(key, value)
+            and (errors := _node_checkpoint_evidence_errors(packet, value))
+        }
 
     def _recover_structured_failed_pm(current_cp: Dict[str, Any]) -> Dict[str, Any]:
         failed_items = [
@@ -1983,25 +2510,19 @@ def run_phase2_debate(analyst_results: List[Dict[str, Any]], gen=None, dry_run: 
             logger.info(f"候选股 {len(candidates)} 只，checkpoint {len(done_set)} 只，{len(missing)} 只未完成: {missing[:5]}")
 
     if all_done:
-        logger.info(f"所有 {len(candidates)} 只候选股已在 checkpoint 完成，直接使用结果；仍重建 K 线数据包用于量化做多分")
+        logger.info(f"所有 {len(candidates)} 只候选股已在 checkpoint 完成，直接使用结果；从 Phase1 唯一缓存重建评分数据包")
         saved_results = {_candidate_stock(c): cp["results"][_candidate_stock(c)] for c in candidates if _candidate_stock(c) in cp["results"]}
         results = list(saved_results.values())
         phase1_cache = load_phase1_cache(OUTPUT_DIR)
-        try:
-            from stock_selection_debate.data_fetcher import _prefetch_debate_data
-            _prefetch_debate_data(candidates)
-        except Exception as e:
-            logger.warning(f"Route-B 评分数据预获取失败（继续逐票拉取）: {e}")
+        from stock_selection_debate.data_fetcher import get_cached_debate_klines
         debate_packets = []
         failed_stocks = []
         for i, c in enumerate(candidates):
             stock = _candidate_stock(c)
             name = _candidate_name(c)
-            try:
-                kline = fetch_kline(stock)
-            except Exception as e:
-                logger.warning(f"K线获取失败 {stock} {name}，使用空数据包评分: {e}")
-                kline = []
+            kline = get_cached_debate_klines(stock)
+            if not kline:
+                logger.warning(f"Phase1 K线缓存缺失 {stock} {name}，构包器将按固定路由补取")
                 failed_stocks.append(stock)
             packet = build_debate_packet(stock, name, phase1_cache, kline)
             for source_key in (
@@ -2036,29 +2557,85 @@ def run_phase2_debate(analyst_results: List[Dict[str, Any]], gen=None, dry_run: 
                     if f != "SECTOR_MISSING"
                 ]
             fin = c.get("_financial")
-            if fin and isinstance(fin, dict):
-                for k, v in fin.items():
-                    if v is not None and packet["financial"].get(k) is None:
-                        packet["financial"][k] = v
+            _merge_candidate_financial(packet, fin)
             c["_financial"] = packet.get("financial")
             c["money_flow"] = packet.get("money_flow")
             c["_data_quality_flags"] = packet.get("data_quality_flags", [])
+            packet = _refresh_debate_packet_metadata(packet)
+            packet = attach_knowledge_rules(packet, c)
             c["kline_summary"] = packet.get("kline_summary", {})
             c["indicators"] = packet.get("indicators", {})
+            c["verified_market_snapshot"] = packet.get("verified_market_snapshot", {})
+            c["data_router_summary"] = packet.get("data_router_summary", {})
             c["kline_raw"] = packet.get("kline_raw", [])
             debate_packets.append(packet)
         if failed_stocks:
             logger.warning(f"评分数据包 K线缺失 {len(failed_stocks)} 只: {failed_stocks[:5]}...")
+
+        packet_by_code = {
+            str(packet.get("stock_code") or "").zfill(6): packet
+            for packet in debate_packets
+            if packet.get("stock_code")
+        }
+        invalid_completed = {
+            code: failures
+            for completed_code in list(cp.get("completed") or [])
+            if (code := str(completed_code or "").zfill(6))
+            and (failures := _completed_node_evidence_failures(code, packet_by_code.get(code)))
+        }
+        if invalid_completed:
+            node_dir = OUTPUT_DIR / "debate_node_checkpoints" / date.today().strftime("%Y%m%d")
+            for code, failures in invalid_completed.items():
+                examples = "; ".join(
+                    f"{key}:{'/'.join(errors[:2])}"
+                    for key, errors in list(failures.items())[:2]
+                )
+                logger.warning(
+                    f"Resume 模式：已完成股票 {code} 不符合当前证据合同，"
+                    f"撤销完成状态并重跑 ({examples})"
+                )
+                node_file = node_dir / f"{code}.json"
+                try:
+                    node_payload = json.loads(node_file.read_text(encoding="utf-8"))
+                    node_payload["nodes"] = {}
+                    node_payload["updated_at"] = datetime.now().isoformat()
+                    write_json_atomic(node_file, node_payload)
+                except Exception as e:
+                    logger.warning(f"清空无效节点快照失败 {code}: {e}")
+                cp["completed"] = [
+                    item for item in (cp.get("completed") or [])
+                    if str(item or "").zfill(6) != code
+                ]
+                cp.setdefault("results", {}).pop(code, None)
+                cp["failed"] = [
+                    item for item in (cp.get("failed") or [])
+                    if str(item or "").zfill(6) != code
+                ]
+                status = cp.setdefault("node_status", {}).setdefault(code, {})
+                status.update({
+                    "completed_nodes": [],
+                    "pm": False,
+                    "scoring_done": False,
+                    "updated_at": datetime.now().isoformat(),
+                })
+            _save_outer_checkpoint(cp)
+            logger.warning(
+                f"Resume 模式：全完成快速路径复验后撤销 {len(invalid_completed)} 只结果，"
+                "立即进入节点级续跑"
+            )
+            return run_phase2_debate(
+                analyst_results,
+                gen=gen,
+                dry_run=dry_run,
+                model=model,
+                resume=True,
+            )
         market_context = ''
     else:
         # 加载 Phase 1 财务缓存
         phase1_cache = load_phase1_cache(OUTPUT_DIR)
         logger.info(f"Phase1 财务缓存: {len(phase1_cache)} 只，候选股 {len(candidates)} 只")
-        try:
-            from stock_selection_debate.data_fetcher import _prefetch_debate_data
-            _prefetch_debate_data(candidates)
-        except Exception as e:
-            logger.warning(f"Route-B 辩论前预获取失败（继续逐票拉取）: {e}")
+        from stock_selection_debate.data_fetcher import get_cached_debate_klines
 
         # 获取 K 线（多级备用）
         debate_packets = []
@@ -2068,12 +2645,10 @@ def run_phase2_debate(analyst_results: List[Dict[str, Any]], gen=None, dry_run: 
             name = _candidate_name(c)
             if stock in done_set and stock in cp.get("results", {}):
                 logger.info(f"Checkpoint 已有LLM结果，仍重建评分数据包: {stock} {name}")
-            try:
-                kline = fetch_kline(stock)
-            except Exception as e:
-                logger.warning(f"K线获取失败 {stock} {name}，使用空数据包评分: {e}")
+            kline = get_cached_debate_klines(stock)
+            if not kline:
+                logger.warning(f"Phase1 K线缓存缺失 {stock} {name}，构包器将按固定路由补取")
                 failed_stocks.append(stock)
-                kline = []
             packet = build_debate_packet(stock, name, phase1_cache, kline)
             # 保留第一阶段筛选来源，让辩论和盘中买入知道这是追涨、低吸还是资金吸筹。
             for source_key in (
@@ -2115,12 +2690,13 @@ def run_phase2_debate(analyst_results: List[Dict[str, Any]], gen=None, dry_run: 
                 ]
             # _financial: 注入完整财务数据（包含 build_debate_packet 未能获取的字段）
             fin = c.get("_financial")
-            if fin and isinstance(fin, dict):
-                for k, v in fin.items():
-                    if v is not None and packet["financial"].get(k) is None:
-                        packet["financial"][k] = v
+            _merge_candidate_financial(packet, fin)
+            packet = _refresh_debate_packet_metadata(packet)
+            packet = attach_knowledge_rules(packet, c)
             c["kline_summary"] = packet.get("kline_summary", {})
             c["indicators"] = packet.get("indicators", {})
+            c["verified_market_snapshot"] = packet.get("verified_market_snapshot", {})
+            c["data_router_summary"] = packet.get("data_router_summary", {})
             c["kline_raw"] = packet.get("kline_raw", [])
             debate_packets.append(packet)
 
@@ -2162,22 +2738,23 @@ def run_phase2_debate(analyst_results: List[Dict[str, Any]], gen=None, dry_run: 
                         return cp
                 except:
                     pass
-            return {
-                "date": date.today().strftime("%Y%m%d"),
-                "completed": [],
-                "failed": [],
-                "results": {},
-                "candidates": _checkpoint_candidate_snapshot(candidates),
-                "screening_signature": current_screening_signature,
-                "candidate_signature": current_candidate_signature,
-            }
+            return new_checkpoint_state(
+                trading_day=date.today().strftime("%Y%m%d"),
+                candidates=_checkpoint_candidate_snapshot(candidates),
+                screening_signature=current_screening_signature,
+                candidate_signature=current_candidate_signature,
+                version_meta=_workflow_version_meta(model=model),
+            )
 
         def save_checkpoint_unlocked(cp):
-            cp["date"] = date.today().strftime("%Y%m%d")
-            if current_screening_signature:
-                cp["screening_signature"] = current_screening_signature
-            cp["candidate_signature"] = current_candidate_signature
-            cp["candidates"] = _checkpoint_candidate_snapshot(candidates)
+            refresh_checkpoint_metadata(
+                cp,
+                trading_day=date.today().strftime("%Y%m%d"),
+                candidates=_checkpoint_candidate_snapshot(candidates),
+                screening_signature=current_screening_signature,
+                candidate_signature=current_candidate_signature,
+                version_meta=_workflow_version_meta(model=model),
+            )
             tmp = cp_file.with_name(f"{cp_file.name}.{os.getpid()}.{threading.get_ident()}.tmp")
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(cp, f, ensure_ascii=False)
@@ -2213,6 +2790,7 @@ def run_phase2_debate(analyst_results: List[Dict[str, Any]], gen=None, dry_run: 
                                 "pm": bool((result or {}).get("decision_source")),
                                 "scoring_done": False,
                                 "updated_at": datetime.now().isoformat(),
+                                "version_meta": _workflow_version_meta(model=model),
                             }
                             cp["failed"] = [f for f in cp.get("failed", []) if f != code]
                         else:
@@ -2224,6 +2802,101 @@ def run_phase2_debate(analyst_results: List[Dict[str, Any]], gen=None, dry_run: 
                 except Exception as e:
                     logger.error(f"[checkpoint_cb] save FAILED: {e}")
 
+        node_checkpoint_dir = OUTPUT_DIR / "debate_node_checkpoints" / date.today().strftime("%Y%m%d")
+        node_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        def _node_checkpoint_file(code: str) -> Path:
+            return node_checkpoint_dir / f"{str(code).zfill(6)}.json"
+
+        def _load_resume_node_states(
+            code: str,
+            packet: Optional[Dict[str, Any]] = None,
+        ) -> Dict[str, Dict[str, Any]]:
+            path = _node_checkpoint_file(code)
+            if not path.exists():
+                return {}
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+            if (
+                payload.get("date") != date.today().strftime("%Y%m%d")
+                or payload.get("candidate_signature") != current_candidate_signature
+                or payload.get("version_meta") != _workflow_version_meta(model=model)
+            ):
+                return {}
+            nodes = payload.get("nodes") or {}
+            if not isinstance(nodes, dict):
+                return {}
+            reusable = {
+                key: value for key, value in nodes.items()
+                if _node_checkpoint_entry_reusable(key, value)
+            }
+            evidence_failures = {
+                key: errors
+                for key, value in reusable.items()
+                if (errors := _node_checkpoint_evidence_errors(packet, value))
+            }
+            if evidence_failures:
+                examples = "; ".join(
+                    f"{key}:{'/'.join(errors[:2])}"
+                    for key, errors in list(evidence_failures.items())[:2]
+                )
+                logger.warning(
+                    f"Resume 模式：{code} 旧节点不符合当前证据合同，"
+                    f"清空 {len(nodes)} 个节点并重跑 ({examples})"
+                )
+                reusable = {}
+            dropped = len(nodes) - len(reusable)
+            if dropped:
+                logger.warning(f"Resume 模式：{code} 丢弃 {dropped} 个无效节点快照并重新执行")
+                payload["nodes"] = reusable
+                payload["updated_at"] = datetime.now().isoformat()
+                write_json_atomic(path, payload)
+            return reusable
+
+        def node_checkpoint_cb(code: str, node_key: str, state_snapshot: Dict[str, Any]) -> None:
+            with _lock:
+                try:
+                    path = _node_checkpoint_file(code)
+                    payload: Dict[str, Any] = {}
+                    if path.exists():
+                        try:
+                            payload = json.loads(path.read_text(encoding="utf-8"))
+                        except Exception:
+                            payload = {}
+                    if (
+                        payload.get("candidate_signature") != current_candidate_signature
+                        or payload.get("version_meta") != _workflow_version_meta(model=model)
+                    ):
+                        payload = {}
+                    payload.update({
+                        "date": date.today().strftime("%Y%m%d"),
+                        "stock": code,
+                        "candidate_signature": current_candidate_signature,
+                        "version_meta": _workflow_version_meta(model=model),
+                        "updated_at": datetime.now().isoformat(),
+                    })
+                    payload.setdefault("nodes", {})[node_key] = state_snapshot
+                    write_json_atomic(path, payload)
+                    with _exclusive_file_lock(cp_lock_file):
+                        current = load_checkpoint_unlocked()
+                        status = current.setdefault("node_status", {}).setdefault(code, {})
+                        completed_nodes = list(status.get("completed_nodes") or [])
+                        if node_key not in completed_nodes:
+                            completed_nodes.append(node_key)
+                        status.update({
+                            "data_packet_ready": True,
+                            "completed_nodes": completed_nodes,
+                            "last_node": node_key,
+                            "node_checkpoint_path": str(path),
+                            "updated_at": datetime.now().isoformat(),
+                        })
+                        save_checkpoint_unlocked(current)
+                    logger.info(f"[node_checkpoint] {code} {node_key}")
+                except Exception as e:
+                    logger.error(f"[node_checkpoint] save FAILED {code} {node_key}: {e}")
+
         cp = load_checkpoint()
         cp_date = cp.get("date", "")
         today_str = date.today().strftime("%Y%m%d")
@@ -2232,6 +2905,53 @@ def run_phase2_debate(analyst_results: List[Dict[str, Any]], gen=None, dry_run: 
             logger.warning(f"Checkpoint 日期 {cp_date} != 今天 {today_str}，清空 failed set")
             cp["failed"] = []
             save_checkpoint(cp)
+
+        packet_by_code = {
+            str(packet.get("stock_code") or "").zfill(6): packet
+            for packet in debate_packets
+            if packet.get("stock_code")
+        }
+        invalid_completed: Dict[str, Dict[str, List[str]]] = {}
+        for completed_code in list(cp.get("completed") or []):
+            normalized_code = str(completed_code or "").zfill(6)
+            failures = _completed_node_evidence_failures(
+                normalized_code,
+                packet_by_code.get(normalized_code),
+            )
+            if failures:
+                invalid_completed[normalized_code] = failures
+
+        if invalid_completed:
+            for code, failures in invalid_completed.items():
+                examples = "; ".join(
+                    f"{key}:{'/'.join(errors[:2])}"
+                    for key, errors in list(failures.items())[:2]
+                )
+                logger.warning(
+                    f"Resume 模式：已完成股票 {code} 不符合当前证据合同，"
+                    f"撤销完成状态并重跑 ({examples})"
+                )
+                _load_resume_node_states(code, packet_by_code.get(code))
+                cp["completed"] = [
+                    item for item in (cp.get("completed") or [])
+                    if str(item or "").zfill(6) != code
+                ]
+                cp.setdefault("results", {}).pop(code, None)
+                cp["failed"] = [
+                    item for item in (cp.get("failed") or [])
+                    if str(item or "").zfill(6) != code
+                ]
+                status = cp.setdefault("node_status", {}).setdefault(code, {})
+                status.update({
+                    "completed_nodes": [],
+                    "pm": False,
+                    "scoring_done": False,
+                    "updated_at": datetime.now().isoformat(),
+                })
+            save_checkpoint(cp)
+            logger.warning(
+                f"Resume 模式：共撤销 {len(invalid_completed)} 只含事实错误的已完成结果"
+            )
         done_set = set(cp["completed"])
         failed_set = set(cp["failed"])
         # 旧版 checkpoint（completed 列表为空，failed 却有大量股票）说明是 2026-05-17 残留
@@ -2254,13 +2974,41 @@ def run_phase2_debate(analyst_results: List[Dict[str, Any]], gen=None, dry_run: 
             logger.warning(f"Checkpoint 中 {len(retry_failed)} 只失败股将重试")
         logger.info(f"待辩论: {len(pending_packets)} 只（跳过 {len(done_set)} 已完成，重试 {len(retry_failed)} 失败）")
 
-        # 执行辩论（新 LangGraph 版本）
-        debate = StockDebateEngine(model=model, max_debate_rounds=1)
-        logger.info(f"===== 辩论引擎启动 ===== 待辩论: {len(pending_packets)} 只, 市场上下文长度: {len(market_context)}chars")
+        # 分层辩论：全体至少一轮，Phase1 池内分领先的15只执行两轮针对性多空辩论。
+        two_round_packets, one_round_packets = _split_layered_debate_packets(
+            debate_packets,
+            pending_packets,
+            shortlist_size=15,
+        )
+        resume_node_states = {
+            str(p.get("stock_code") or ""): _load_resume_node_states(
+                str(p.get("stock_code") or ""),
+                p,
+            )
+            for p in pending_packets
+        }
+        reused_node_count = sum(len(v) for v in resume_node_states.values())
+        logger.info(
+            f"===== 分层辩论引擎启动 ===== 待辩论={len(pending_packets)} "
+            f"两轮={len(two_round_packets)} 一轮={len(one_round_packets)} "
+            f"复用节点={reused_node_count} 市场上下文={len(market_context)}chars"
+        )
         if pending_packets:
             try:
                 safe_parallel = max(1, min(3, int(os.getenv("DEBATE_MAX_PARALLEL", "3"))))
-                new_results = debate.run(pending_packets, market_context=market_context, checkpoint_cb=checkpoint_cb, max_parallel=safe_parallel)
+                new_results = []
+                for round_count, packets in ((2, two_round_packets), (1, one_round_packets)):
+                    if not packets:
+                        continue
+                    debate = StockDebateEngine(model=model, max_debate_rounds=round_count)
+                    new_results.extend(debate.run(
+                        packets,
+                        market_context=market_context,
+                        checkpoint_cb=checkpoint_cb,
+                        node_checkpoint_cb=node_checkpoint_cb,
+                        resume_node_states=resume_node_states,
+                        max_parallel=safe_parallel,
+                    ))
                 logger.info(f"辩论引擎返回 new_results={len(new_results)} 只")
             except Exception as e:
                 logger.error(f"辩论引擎异常: {e}")
@@ -2356,6 +3104,11 @@ def run_phase2_debate(analyst_results: List[Dict[str, Any]], gen=None, dry_run: 
             "sector": r.get("sector") or source_meta.get("sector", ""),
             "money_flow": r.get("money_flow", {}),
             "data_contract": r.get("data_contract", {}) or pkt.get("data_contract", {}),
+            "verified_market_snapshot": r.get("verified_market_snapshot", {}) or pkt.get("verified_market_snapshot", {}),
+            "market_snapshot_version": r.get("market_snapshot_version", "") or pkt.get("market_snapshot_version", ""),
+            "data_router_version": r.get("data_router_version", "") or pkt.get("data_router_version", ""),
+            "data_router_summary": r.get("data_router_summary", {}) or pkt.get("data_router_summary", {}),
+            "debate_rounds": r.get("debate_rounds", 1),
             "signal": r.get("signal", "WATCH"),
             "buy_score": r.get("buy_score", _buy_score_value(r)),
             "confidence": r.get("confidence", 50),
@@ -2419,7 +3172,7 @@ def run_phase2_debate(analyst_results: List[Dict[str, Any]], gen=None, dry_run: 
         ranked.append(c)
 
     try:
-        cp_latest = cp if isinstance(cp, dict) else {}
+        cp_latest = _load_outer_checkpoint()
         node_status = cp_latest.get("node_status") or {}
         for c in ranked:
             stock_key = str(c.get("stock", "")).zfill(6)
@@ -2450,11 +3203,15 @@ def run_phase2_debate(analyst_results: List[Dict[str, Any]], gen=None, dry_run: 
     phase2["timestamp"] = datetime.now().isoformat()
     phase2["screening_signature"] = current_screening_signature
     try:
+        cp_summary_source = _load_outer_checkpoint()
+        node_states = cp_summary_source.get("node_status") or {}
         phase2["checkpoint_summary"] = {
-            "completed": len((cp or {}).get("completed") or []),
-            "failed": len((cp or {}).get("failed") or []),
-            "results": len((cp or {}).get("results") or {}),
-            "node_status": len((cp or {}).get("node_status") or {}),
+            "completed": len(cp_summary_source.get("completed") or []),
+            "failed": len(cp_summary_source.get("failed") or []),
+            "results": len(cp_summary_source.get("results") or {}),
+            "node_status": len(node_states),
+            "completed_node_count": sum(len((x or {}).get("completed_nodes") or []) for x in node_states.values()),
+            "reused_node_count": locals().get("reused_node_count", 0),
         }
     except Exception:
         phase2["checkpoint_summary"] = {}
@@ -2552,7 +3309,7 @@ def _push_phase2_feishu(scored: List[Dict], top_picks: List[Dict]):
 
 # ── Phase 3a: 选股回测（验证候选股本身好不好）─────────────
 
-def run_backtest_selection(scored_candidates: List[Dict], lookback_days: int = 5) -> Dict[str, Any]:
+def _run_backtest_selection_legacy(scored_candidates: List[Dict], lookback_days: int = 5) -> Dict[str, Any]:
     """
     选股回测：验证候选股在信号日后N天内的表现（快照法）
     - 问题：这批股票本身好不好？（不涉及仓位/止损止盈）
@@ -2608,7 +3365,7 @@ def run_backtest_selection(scored_candidates: List[Dict], lookback_days: int = 5
 
 # ── Phase 3b: 持仓周期回测（验证20日持仓策略相对大盘的超额收益）──
 
-def run_backtest_strategy(scored_candidates: List[Dict], hold_days: int = 20, lookback_days: int = None) -> Dict[str, Any]:
+def _run_backtest_strategy_legacy(scored_candidates: List[Dict], hold_days: int = 20, lookback_days: int = None) -> Dict[str, Any]:
     """
     持仓周期回测：验证若按信号买入、持有20个交易日后相对大盘的超额收益
     - 使用 Backtrader 事件驱动引擎（T+1 / 佣金 / 滑点 / 止损止盈）
@@ -2820,6 +3577,143 @@ def run_backtest_strategy(scored_candidates: List[Dict], hold_days: int = 20, lo
             f"持仓{hold_days}天均收益 {avg_ret:+.2f}%"
             + (f" | 沪深300基准 {hs300_ret:+.2f}% | Alpha {alpha:+.2f}%"
                if alpha is not None else "")
+        ),
+    }
+
+
+def run_backtest_selection(scored_candidates: List[Dict], lookback_days: int = 5) -> Dict[str, Any]:
+    """Register current Top5 for forward validation without using future data."""
+    report_day = date.today().strftime("%Y%m%d")
+    stocks = []
+    for candidate in (scored_candidates or [])[:5]:
+        stocks.append({
+            "stock": candidate.get("stock"),
+            "name": candidate.get("name") or candidate.get("stock"),
+            "signal": candidate.get("signal", "WATCH"),
+            "report_date": report_day,
+            "status": "pending_forward_validation",
+            "horizons": [1, 3, 5, 10],
+        })
+    return {
+        "type": "selection",
+        "status": "pending_forward_validation" if stocks else "no_candidates",
+        "lookback_days": lookback_days,
+        "stocks": stocks,
+        "trades": [],
+        "summary": "当前Top5将在D+1/D+3/D+5/D+10由复盘任务补齐，早报不使用未来数据回测",
+    }
+
+
+def _load_completed_forward_samples(horizon: str = "d10", limit_days: int = 20) -> List[Dict[str, Any]]:
+    path = OUTPUT_DIR / "selection_memory.jsonl"
+    if not path.exists():
+        return []
+    today_key = date.today().strftime("%Y%m%d")
+    rows: List[Dict[str, Any]] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return []
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except Exception:
+            continue
+        if not item.get("top5_rank"):
+            continue
+        report_day = re.sub(r"\D", "", str(item.get("report_date") or ""))[:8]
+        if not report_day or report_day >= today_key:
+            continue
+        value = item.get(f"return_{horizon}_pct")
+        if item.get(f"return_{horizon}_complete") is not True:
+            continue
+        try:
+            ret = float(value)
+        except (TypeError, ValueError):
+            continue
+        alpha_value = item.get(f"alpha_{horizon}_pct")
+        try:
+            alpha = float(alpha_value) if alpha_value is not None else None
+        except (TypeError, ValueError):
+            alpha = None
+        rows.append({
+            "report_date": report_day,
+            "stock": str(item.get("stock") or "").zfill(6),
+            "return_pct": ret,
+            "alpha_pct": alpha,
+        })
+    days = sorted({row["report_date"] for row in rows})[-max(1, limit_days):]
+    allowed = set(days)
+    return [row for row in rows if row["report_date"] in allowed]
+
+
+def run_backtest_strategy(scored_candidates: List[Dict], hold_days: int = 20, lookback_days: int = None) -> Dict[str, Any]:
+    """Summarize completed historical forward samples; never replay today's picks backward."""
+    if not scored_candidates:
+        return {"type": "strategy", "status": "no_candidates", "trades": []}
+    requested_horizon = "d10" if hold_days >= 10 else "d5"
+    try:
+        minimum_samples = max(1, int(os.getenv("FORWARD_VALIDATION_MIN_SAMPLES", "10")))
+    except (TypeError, ValueError):
+        minimum_samples = 10
+
+    d10_samples = _load_completed_forward_samples(horizon="d10", limit_days=20)
+    d5_samples = _load_completed_forward_samples(horizon="d5", limit_days=20)
+    samples = d10_samples if requested_horizon == "d10" else d5_samples
+    horizon = requested_horizon
+    fallback_used = False
+    if requested_horizon == "d10" and len(d10_samples) < minimum_samples and d5_samples:
+        samples = d5_samples
+        horizon = "d5"
+        fallback_used = True
+    if not samples:
+        return {
+            "type": "strategy",
+            "status": "insufficient_forward_samples",
+            "hold_days": hold_days,
+            "horizon": requested_horizon,
+            "requested_horizon": requested_horizon,
+            "minimum_sample_count": minimum_samples,
+            "d10_sample_count": len(d10_samples),
+            "d5_sample_count": len(d5_samples),
+            "trades": [],
+            "current_top5_status": "pending_forward_validation",
+            "summary": (
+                f"暂无已完成的历史前向样本（D+10 {len(d10_samples)}条，D+5 {len(d5_samples)}条）；"
+                "当前Top5待后续复盘验证"
+            ),
+        }
+    returns = [row["return_pct"] for row in samples]
+    alphas = [row["alpha_pct"] for row in samples if row.get("alpha_pct") is not None]
+    avg_return = sum(returns) / len(returns)
+    win_rate = sum(1 for value in returns if value > 0) / len(returns) * 100
+    avg_alpha = sum(alphas) / len(alphas) if alphas else None
+    return {
+        "type": "strategy",
+        "status": "historical_forward_validation",
+        "hold_days": hold_days,
+        "horizon": horizon,
+        "requested_horizon": requested_horizon,
+        "minimum_sample_count": minimum_samples,
+        "fallback_used": fallback_used,
+        "d10_sample_count": len(d10_samples),
+        "d5_sample_count": len(d5_samples),
+        "sample_count": len(samples),
+        "review_days": sorted({row["report_date"] for row in samples}),
+        "trades": [],
+        "current_top5_status": "pending_forward_validation",
+        "avg_return_pct": round(avg_return, 2),
+        "win_rate": round(win_rate, 1),
+        "alpha_pct": round(avg_alpha, 2) if avg_alpha is not None else None,
+        "summary": (
+            f"历史前向{horizon.upper()}样本{len(samples)}条，均收益{avg_return:+.2f}%，"
+            f"胜率{win_rate:.1f}%"
+            + (f"，平均Alpha{avg_alpha:+.2f}%" if avg_alpha is not None else "")
+            + (
+                f"（D10成熟{len(d10_samples)}条，未达{minimum_samples}条，暂用D5）"
+                if fallback_used else ""
+            )
+            + "；当前Top5待验证"
         ),
     }
 
@@ -3184,6 +4078,7 @@ def route_a_phase2(analyst_results: List[Dict[str, Any]], gen=None) -> Dict[str,
 # ── 主流程 ──────────────────────────────────────────────
 
 def run_daily_workflow(dry_run: bool = False, model: str = "volcengine-plan/ark-code-latest", resume: bool = False):
+    setup_logging()
     lock_fh = None
     external_lock_held = os.getenv("DAILY_STOCK_WORKFLOW_LOCK_HELD") == "1"
     if not dry_run and not external_lock_held:
@@ -3258,9 +4153,28 @@ def _run_daily_workflow_locked(dry_run: bool = False, model: str = "volcengine-p
 
     # ── Phase 1 + Phase 2（resume时跳过Phase 1，直接用checkpoint辩论）─────
     if resume:
-        logger.info("Resume 模式：从 checkpoint 恢复辩论，并恢复 Phase 1 市场上下文")
+        logger.info("Resume 模式：恢复今日 Phase 1/辩论断点，不重新运行已完成的分析师")
         phase1_results = _ensure_resume_market_context(_load_phase1_context())
         gen = None
+        candidate_snapshot = _load_phase1_candidates()
+        if candidate_snapshot:
+            from llm_scorer import CandidateGenerator
+            gen = CandidateGenerator(SKILLS_DIR, OUTPUT_DIR)
+            gen.candidates = candidate_snapshot["candidates"]
+            if candidate_snapshot.get("screening_signature"):
+                gen.screening_signature = candidate_snapshot["screening_signature"]
+            _prefetch_phase2_candidates(gen.candidates)
+            _save_phase1_candidates(gen)
+        elif not _today_debate_checkpoint_available():
+            # Older runs saved Phase 1 context but not the candidate snapshot.
+            # Rebuild only the candidate generator once, then persist it before prefetch.
+            logger.warning("今日已有 Phase 1 上下文但无候选池/辩论断点，仅重建候选池后续跑")
+            from llm_scorer import CandidateGenerator
+            gen = CandidateGenerator(SKILLS_DIR, OUTPUT_DIR)
+            gen.prewarm_cache()
+            _save_phase1_candidates(gen)
+            _prefetch_phase2_candidates(getattr(gen, "candidates", []) or [])
+            _save_phase1_candidates(gen)
         phase2_result = run_phase2_debate(phase1_results, gen=gen, dry_run=dry_run, model=model, resume=resume)
     else:
         # Phase 1: 并行分析师
@@ -3309,55 +4223,61 @@ def _run_daily_workflow_locked(dry_run: bool = False, model: str = "volcengine-p
                         phase1_results.append({"status": "error", "name": analyst.name, "error": str(e)})
 
         _save_phase1_context(phase1_results)
+        _save_phase1_candidates(gen)
 
         # 预获取辩论数据包（K线+资金流+新闻），Phase 2 直接读缓存
         if gen is not None and hasattr(gen, 'candidates') and gen.candidates:
-            try:
-                from stock_selection_debate.data_fetcher import _prefetch_debate_data
-                _prefetch_debate_data(gen.candidates)
-            except Exception as e:
-                logger.warning(f"辩论数据预获取失败: {e}")
+            _prefetch_phase2_candidates(gen.candidates)
+            _save_phase1_candidates(gen)
 
         # ── Phase 2: 完全版辩论 ────────────────────────────────
         logger.info("Phase 2: 选股辩论（替代LLM打分）...")
         phase2_result = run_phase2_debate(phase1_results, gen=gen, dry_run=dry_run, model=model, resume=resume)
-        sector_rotation = _extract_sector_rotation(
-            phase1_results,
-            phase2_result,
-            phase2_result.get('ranked_candidates', []),
-        )
-        if sector_rotation.get("强势板块") or sector_rotation.get("弱势板块"):
-            phase2_result["sector_rotation"] = sector_rotation
-
         # 打印分析师报告摘要
         for r in phase2_result.get('all_analysts', phase1_results):
             if r.get("status") == "success":
                 findings = r.get("findings", "（无内容）")
                 logger.info(f"\n{r.get('color')} {r.get('name')} 报告:\n{findings}\n")
 
-    # ── QMT HTTP 预热等待（最多30秒）────────────
-    import urllib.request
-    qmt_ready = False
-    for _ in range(30):
-        try:
-            with urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=3) as r:
-                if json.loads(r.read())["status"] == "ok":
-                    qmt_ready = True
-                    break
-        except:
-            pass
-        time.sleep(1)
-    if not qmt_ready:
-        logger.warning("QMT HTTP 未就绪，回测可能失败")
+    # Resume 和完整运行必须在持久化报告前生成相同的板块轮动元数据。
+    # 卡片渲染阶段只读该结果，避免推送摘要与磁盘日报摘要不一致。
+    sector_rotation = _extract_sector_rotation(
+        phase1_results,
+        phase2_result,
+        phase2_result.get('ranked_candidates', []),
+    )
+    if sector_rotation.get("强势板块") or sector_rotation.get("弱势板块"):
+        phase2_result["sector_rotation"] = sector_rotation
+    consistency_check = validate_and_repair_phase2_consistency(phase2_result)
+    _prepare_report_render_snapshot(phase1_results, phase2_result)
+    health_ranked = phase2_result.get("ranked_candidates") or []
+    health_source_counts: Dict[str, int] = {}
+    for candidate in health_ranked:
+        source = candidate.get("decision_source") or (
+            "Structured" if str(candidate.get("final_decision") or "").startswith("[Structured]") else ""
+        )
+        if source:
+            health_source_counts[str(source)] = health_source_counts.get(str(source), 0) + 1
+    model_health = _build_model_execution_summary(
+        health_ranked,
+        phase2_result.get("checkpoint_summary") or {},
+    )
+    model_health["decision_sources"] = health_source_counts
+    phase2_result["workflow_health_summary"] = {
+        "candidate_count": len(health_ranked),
+        "data_quality": phase2_result.get("data_quality_summary") or {},
+        "model_execution": model_health,
+        "checkpoint": phase2_result.get("checkpoint_summary") or {},
+    }
 
-    # ── Phase 3a: 选股回测（候选股本身好不好）───────────
-    logger.info("Phase 3a: 选股回测...")
+    # ── Phase 3a: 登记当前Top5，等待真实前向收益 ────────────
+    logger.info("Phase 3a: 登记Top5前向验证...")
     top_picks = phase2_result.get('top_picks', [])
 
     backtest_selection = run_backtest_selection(top_picks) if top_picks else {"type": "selection", "status": "no_candidates"}
 
-    # ── Phase 3b: 策略回测（完整交易策略）───────────────
-    logger.info("Phase 3b: 策略回测...")
+    # ── Phase 3b: 汇总已完成的历史前向样本 ────────────────
+    logger.info("Phase 3b: 历史前向样本汇总...")
     backtest_strategy = run_backtest_strategy(top_picks) if top_picks else {"type": "strategy", "status": "no_candidates"}
     _attach_top_pick_backtests(phase2_result, backtest_selection, backtest_strategy)
 
@@ -3373,19 +4293,25 @@ def _run_daily_workflow_locked(dry_run: bool = False, model: str = "volcengine-p
     top5_failure_reason = ""
     if not top_picks:
         top5_failure_reason = "Top5为空：基金经理裁决未产生任何 BUY/WATCH 可买候选，已阻止早报卡片推送"
+    elif not consistency_check.get("publishable"):
+        top5_failure_reason = (
+            "早报一致性检查失败："
+            + json.dumps(consistency_check.get("errors") or [], ensure_ascii=False)[:500]
+        )
+    if top5_failure_reason:
         report["status"] = "failed"
         report["failure_reason"] = top5_failure_reason
         logger.error(f"今日选股早报生成失败: {top5_failure_reason}")
     else:
         report["status"] = "success"
 
-    report_file = OUTPUT_DIR / f"daily_report_{date.today().strftime('%Y%m%d')}.json"
+    date_key = date.today().strftime('%Y%m%d')
+    try:
+        _write_daily_report_artifacts(report, date_key)
+    except Exception as e:
+        logger.warning(f"日报拆分 artifact 写入失败: {e}")
+    report_file = OUTPUT_DIR / f"daily_report_{date_key}.json"
     report_tmp = report_file.with_name(report_file.name + ".tmp")
-    with open(report_tmp, "w", encoding="utf-8") as f:
-        json.dump(report, f, ensure_ascii=False, indent=2)
-        f.flush()
-    report_tmp.replace(report_file)
-    logger.info(f"报告已保存: {report_file}")
     try:
         from selection_memory import append_daily_selection_memory
         memory_count = append_daily_selection_memory(report, backtest_selection, backtest_strategy)
@@ -3393,13 +4319,15 @@ def _run_daily_workflow_locked(dry_run: bool = False, model: str = "volcengine-p
             "path": str(OUTPUT_DIR / "selection_memory.jsonl"),
             "records_written": memory_count,
         }
-        with open(report_tmp, "w", encoding="utf-8") as f:
-            json.dump(report, f, ensure_ascii=False, indent=2)
-            f.flush()
-        report_tmp.replace(report_file)
         logger.info(f"选股决策记忆已写入: {memory_count} 条")
     except Exception as e:
         logger.warning(f"选股决策记忆写入失败: {e}")
+    persisted_report = _compact_daily_report(report)
+    with open(report_tmp, "w", encoding="utf-8") as f:
+        json.dump(persisted_report, f, ensure_ascii=False, indent=2)
+        f.flush()
+    report_tmp.replace(report_file)
+    logger.info(f"精简日报已保存: {report_file}")
 
     # ── 飞书推送早报卡片 ───────────────────────────────
     webhook = os.getenv("FEISHU_WEBHOOK_URL")
@@ -3461,52 +4389,10 @@ def _run_daily_workflow_locked(dry_run: bool = False, model: str = "volcengine-p
             source = s.get('decision_source') or ('Structured' if str(s.get('final_decision', '')).startswith('[Structured]') else '')
             if source:
                 source_counts[source] = source_counts.get(source, 0) + 1
-        # ★ 6-11 修复：实际跑的模型汇总（从每个 ranked 里的 decision_models 字段统计）
-        # 早报卡片不再误显"火山引擎"：拉取每只股票各节点实际使用的模型
-        actual_models_summary: Dict[str, int] = {}
-        actual_models_examples: Dict[str, str] = {}
-        for s in ranked:
-            for node, m in (s.get('decision_models') or {}).items():
-                # 抹平别名：Structured:GPT-5.5 -> GPT-5.5；Structured:MiniMax-M3 -> MiniMax-M3
-                short = str(m).split(':')[-1] if m else 'unknown'
-                key = f'{node}={short}'
-                actual_models_summary[key] = actual_models_summary.get(key, 0) + 1
-                actual_models_examples.setdefault(key, short)
-        # 生成卡片展示串：按节点聚合，避免同一模型在多个节点上重复显示成
-        # "model×N/N · model×N/N ..."。
-        node_order = ['bull', 'bear', 'judge', 'aggressive', 'conservative', 'neutral', 'pm']
-        node_model_counts: Dict[str, Dict[str, int]] = {}
-        for s in ranked:
-            for node, m in (s.get('decision_models') or {}).items():
-                short = str(m).split(':')[-1] if m else 'unknown'
-                node_model_counts.setdefault(node, {})
-                node_model_counts[node][short] = node_model_counts[node].get(short, 0) + 1
-        display_parts = []
-        debate_nodes = node_order[:-1]
-        debate_model_counts: Dict[str, int] = {}
-        debate_total = 0
-        for node in debate_nodes:
-            for model_name, count in (node_model_counts.get(node) or {}).items():
-                debate_model_counts[model_name] = debate_model_counts.get(model_name, 0) + count
-                debate_total += count
-        if debate_model_counts:
-            debate_desc = ','.join(f"{m}×{c}" for m, c in sorted(debate_model_counts.items(), key=lambda x: -x[1]))
-            display_parts.append(f"辩论节点:{debate_desc}")
-        pm_counts = node_model_counts.get('pm') or {}
-        if pm_counts:
-            pm_desc = ','.join(f"{m}×{c}/{len(ranked)}" for m, c in sorted(pm_counts.items(), key=lambda x: -x[1]))
-            display_parts.append(f"基金经理:{pm_desc}")
-        if display_parts:
-            actual_models_display = ' · '.join(display_parts)
-        elif source_counts:
-            actual_models_display = '结构化裁决（模型明细未记录）'
-        else:
-            actual_models_display = f'{model}（模型明细未记录）'
-        exec_stats = {
-            'total': len(ranked),
-            'model': actual_models_display,
-            'decision_sources': source_counts,
-        }
+        exec_stats = dict((phase2_result.get("workflow_health_summary") or {}).get("model_execution") or {})
+        if not exec_stats:
+            exec_stats = _build_model_execution_summary(ranked, phase2_result.get("checkpoint_summary") or {})
+        exec_stats["decision_sources"] = source_counts
         
         if _daily_report_already_pushed(report):
             logger.warning("今日选股早报已成功推送过，本次跳过飞书推送，避免重复消息")
@@ -3546,28 +4432,6 @@ def _parse_signal(s):
     if '仓位建议' in dec and '0%' in dec:
         return 'AVOID'
     return 'WATCH'
-
-
-def _parse_pos(s):
-    """Return position ratio as a 0-100 percentage for card display."""
-    raw = s.get('position_ratio')
-    has_percent = False
-    if raw in (None, ''):
-        dec = s.get('final_decision', '') or ''
-        m = re.search(r'position_ratio\s*[=：:]\s*([0-9.]+)\s*(%)?', dec, re.IGNORECASE)
-        if not m:
-            return 0
-        raw = m.group(1)
-        has_percent = bool(m.group(2))
-    elif isinstance(raw, str):
-        has_percent = '%' in raw
-        raw = raw.strip().rstrip('%')
-    try:
-        val = float(raw)
-    except (TypeError, ValueError):
-        return 0
-    pct = val if has_percent or val > 1 else val * 100
-    return max(0, min(100, round(pct)))
 
 
 def _confidence_value(s):
@@ -3646,26 +4510,21 @@ def _top5_sort_key(s, strategy_returns=None):
 
 
 def _select_display_top5(ranked, target=5, strategy_returns=None):
-    """BUY first, then WATCH candidates; sort each group by buy_score."""
+    """Select BUY/WATCH together by opportunity score; position is an intraday concern."""
     def _has_buyable_kline(s):
         flags = set(s.get('data_quality_flags') or [])
         return not flags.intersection({'KLINE_MISSING', 'KLINE_SHORT'})
 
-    buy_stocks = sorted(
-        [s for s in ranked if _parse_signal(s) == 'BUY' and _has_buyable_kline(s)],
-        key=lambda x: _top5_sort_key(x, strategy_returns),
-    )
-    watch_stocks = sorted(
+    eligible = sorted(
         [
             s for s in ranked
-            if _parse_signal(s) == 'WATCH'
+            if _parse_signal(s) in {'BUY', 'WATCH'}
             and _has_buyable_kline(s)
-            and _parse_pos(s) > 0
         ],
         key=lambda x: _top5_sort_key(x, strategy_returns),
     )
     seen, deduped = set(), []
-    for s in buy_stocks + watch_stocks:
+    for s in eligible:
         key = s.get('stock') or f"{s.get('name', '')}:{id(s)}"
         if key in seen:
             continue
@@ -3723,6 +4582,57 @@ def _resolve_report_top5_for_display(top_picks, ranked, target=5, strategy_retur
     return display_rows
 
 
+def _report_price_from_verified_snapshot(candidate):
+    """从候选股已验证行情快照提取早报价格，过期或缺失快照不复用。"""
+    if not isinstance(candidate, dict):
+        return None
+    snapshot = candidate.get("verified_market_snapshot") or {}
+    if not isinstance(snapshot, dict) or snapshot.get("status") not in {"ok", "partial"}:
+        return None
+    kline_contract = ((candidate.get("data_contract") or {}).get("kline") or {})
+    if kline_contract.get("is_stale") is True:
+        return None
+
+    def _number(value):
+        try:
+            if value in (None, ""):
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    close = _number(snapshot.get("latest_close"))
+    prev_close = _number(snapshot.get("previous_close"))
+    pct = _number(snapshot.get("pct_change_1d"))
+    if close is None or close <= 0:
+        return None
+    if prev_close is not None and prev_close > 0 and pct is None:
+        pct = (close / prev_close - 1) * 100
+    elif (prev_close is None or prev_close <= 0) and pct is not None and pct > -100:
+        prev_close = close / (1 + pct / 100)
+    return {
+        "close": close,
+        "prev_close": prev_close,
+        "pct": round(pct, 2) if pct is not None else None,
+        "source": f"verified_market_snapshot:{snapshot.get('source') or 'kline_raw'}",
+        "as_of": snapshot.get("latest_date") or snapshot.get("as_of") or kline_contract.get("as_of") or "",
+    }
+
+
+def _seed_report_price_cache(candidates):
+    """按股票代码汇总可复用的已验证行情快照。"""
+    price_cache = {}
+    for candidate in candidates or []:
+        raw_code = str((candidate or {}).get("stock") or (candidate or {}).get("stock_code") or "").strip()
+        code = raw_code.split(".", 1)[0].zfill(6) if raw_code else ""
+        if not code or code in price_cache:
+            continue
+        price = _report_price_from_verified_snapshot(candidate)
+        if price:
+            price_cache[code] = price
+    return price_cache
+
+
 def _attach_top_pick_backtests(phase2_result, backtest_selection, backtest_strategy):
     top_picks = phase2_result.get('top_picks') or []
     if not top_picks:
@@ -3739,6 +4649,8 @@ def _attach_top_pick_backtests(phase2_result, backtest_selection, backtest_strat
     }
     for pick in top_picks:
         stock = str(pick.get('stock') or '')
+        pick.pop('selection_backtest', None)
+        pick.pop('strategy_backtest', None)
         if stock in selection_by_stock:
             pick['selection_backtest'] = selection_by_stock[stock]
         if stock in strategy_by_stock:
@@ -3807,7 +4719,7 @@ def _extract_sector_rotation(phase1_results, phase2_result, ranked):
             weight = 1.0
             if _parse_signal(s) == "BUY":
                 weight += 2.0
-            elif _parse_signal(s) == "WATCH" and _parse_pos(s) > 0:
+            elif _parse_signal(s) == "WATCH":
                 weight += 1.0
             weight += _confidence_value(s) / 100.0
             sector_scores[sector] = sector_scores.get(sector, 0.0) + weight
@@ -3862,7 +4774,7 @@ def _summarize_news_one_line(findings: str, max_len: int = 300) -> str:
     if not titles:
         return "今日无重要舆情"
 
-    # 优先用统一 provider 总结：GPT-5.5 主用，MiniMax M3 兜底。
+    # 优先用统一 provider 总结：火山主用，GPT-5.6 Sol 兜底。
     import logging as _logging
     _log = _logging.getLogger("daily_stock_workflow")
     try:
@@ -3879,7 +4791,7 @@ def _summarize_news_one_line(findings: str, max_len: int = 300) -> str:
         summary = call_llm_with_fallback(
             prompt=prompt,
             model=os.getenv("NEWS_SENTIMENT_SUMMARY_MODEL", "volcengine-plan/ark-code-latest"),
-            fallback_model=os.getenv("NEWS_SENTIMENT_SUMMARY_FALLBACK_MODEL", "openai/gpt-5.5"),
+            fallback_model=os.getenv("NEWS_SENTIMENT_SUMMARY_FALLBACK_MODEL", "openai/gpt-5.6-sol"),
             timeout=int(os.getenv("NEWS_SENTIMENT_SUMMARY_TIMEOUT", "120")),
             retries=int(os.getenv("NEWS_SENTIMENT_SUMMARY_RETRIES", "3")),
             max_tokens=int(os.getenv("NEWS_SENTIMENT_SUMMARY_MAX_TOKENS", "5000")),
@@ -3906,6 +4818,124 @@ def _summarize_news_one_line(findings: str, max_len: int = 300) -> str:
     return s
 
 
+def _prepare_report_render_snapshot(phase1_results: List[Dict], phase2_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Prepare every value needed by the card before report persistence."""
+    ranked = phase2_result.get("ranked_candidates") or []
+    top_picks = phase2_result.get("top_picks") or []
+    prices = _seed_report_price_cache(list(ranked) + list(top_picks))
+    news_findings = next(
+        (
+            str(item.get("findings") or "")
+            for item in phase1_results or []
+            if item.get("name") == "新闻分析师" and item.get("findings")
+        ),
+        "",
+    )
+    market: Dict[str, Any] = {}
+    for item in phase1_results or []:
+        for key in ("market_snapshot", "market_data", "structured_data"):
+            value = item.get(key)
+            if isinstance(value, dict):
+                market.update({k: v for k, v in value.items() if v not in (None, "")})
+        findings = str(item.get("findings") or "")
+        for code, label in (("000001", "sh_pct"), ("399001", "sz_pct"), ("399006", "cy_pct"), ("000300", "hs300_pct")):
+            match = re.search(rf"{code}[^\n]*?(?:涨跌幅|涨幅|日涨跌)\s*[=:：]?\s*([+-]?[\d.]+)%", findings)
+            if match and label not in market:
+                market[label] = float(match.group(1))
+        turnover = re.search(r"(?:两市|沪深A股)[^\n]{0,30}(\d+(?:\.\d+)?)\s*万亿", findings)
+        if turnover and "total_turnover" not in market:
+            market["total_turnover"] = f"{turnover.group(1)}万亿"
+    snapshot = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "prices": prices,
+        "market": market,
+        "news_sentiment_summary": _summarize_news_one_line(news_findings, max_len=300),
+        "sector_rotation": phase2_result.get("sector_rotation") or {},
+        "source": "persisted_phase1_phase2_only",
+        "render_network_allowed": False,
+    }
+    phase2_result["report_render_snapshot"] = snapshot
+    return snapshot
+
+
+def _short_model_name(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "unknown"
+    text = text.split(":")[-1]
+    aliases = {
+        "gpt-5.6-sol": "GPT-5.6 Sol",
+        "openai/gpt-5.6-sol": "GPT-5.6 Sol",
+        "minimax-m3": "MiniMax M3",
+        "minimax-portal/minimax-m3": "MiniMax M3",
+        "ark-code-latest": "火山 Coding Plan",
+        "volcengine-plan/ark-code-latest": "火山 Coding Plan",
+    }
+    return aliases.get(text.lower(), text)
+
+
+def _build_model_execution_summary(ranked: List[Dict[str, Any]], checkpoint_summary: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Count unique stock coverage, never raw node-call volume."""
+    analysis_coverage: Dict[str, set] = {}
+    pm_coverage: Dict[str, set] = {}
+    fallback_stocks = set()
+    primary_analysis = _short_model_name(os.getenv("DEBATE_PRIMARY_MODEL", "volcengine-plan/ark-code-latest"))
+    primary_pm = _short_model_name(os.getenv("PM_PRIMARY_MODEL", "openai/gpt-5.6-sol"))
+    for index, candidate in enumerate(ranked or []):
+        stock = str(candidate.get("stock") or f"row-{index}")
+        models = candidate.get("decision_models") or {}
+        if not isinstance(models, dict):
+            models = {}
+        for node, raw_model in models.items():
+            model_name = _short_model_name(raw_model)
+            target = pm_coverage if str(node).lower() == "pm" else analysis_coverage
+            target.setdefault(model_name, set()).add(stock)
+            if (str(node).lower() == "pm" and model_name != primary_pm) or (
+                str(node).lower() != "pm" and model_name != primary_analysis
+            ):
+                fallback_stocks.add(stock)
+
+    total = len(ranked or [])
+    analysis_parts = [
+        f"{name} {len(stocks)}/{total}只"
+        for name, stocks in sorted(analysis_coverage.items(), key=lambda item: (-len(item[1]), item[0]))
+    ]
+    pm_parts = [
+        f"{name} {len(stocks)}/{total}只"
+        for name, stocks in sorted(pm_coverage.items(), key=lambda item: (-len(item[1]), item[0]))
+    ]
+    checkpoint_summary = checkpoint_summary or {}
+    reused = 0
+    for key in ("reused_stocks", "checkpoint_reused", "resumed", "reused"):
+        value = checkpoint_summary.get(key)
+        if isinstance(value, list):
+            reused = max(reused, len(value))
+        else:
+            try:
+                reused = max(reused, int(value or 0))
+            except (TypeError, ValueError):
+                pass
+    parts = []
+    if analysis_parts:
+        parts.append("分析节点 " + "、".join(analysis_parts))
+    if pm_parts:
+        parts.append("基金经理 " + "、".join(pm_parts))
+    if fallback_stocks:
+        parts.append(f"兜底涉及 {len(fallback_stocks)}只")
+    if reused:
+        parts.append(f"断点复用 {reused}只")
+    if not parts:
+        parts.append("模型明细未记录")
+    return {
+        "total": total,
+        "model": "；".join(parts),
+        "analysis_stock_coverage": {name: len(stocks) for name, stocks in analysis_coverage.items()},
+        "pm_stock_coverage": {name: len(stocks) for name, stocks in pm_coverage.items()},
+        "fallback_stock_count": len(fallback_stocks),
+        "checkpoint_reused_count": reused,
+    }
+
+
 def _send_daily_report_card(phase1_results, phase2_result, backtest_selection, backtest_strategy, webhook,
                            debate_stats=None, data_quality=None, exec_stats=None):
     """每日选股早报飞书卡片 - 辩论版（短线增强版）"""
@@ -3930,106 +4960,18 @@ def _send_daily_report_card(phase1_results, phase2_result, backtest_selection, b
     TARGET = 5
     combined_top5 = _resolve_report_top5_for_display(top_picks, ranked, TARGET)
 
-    # 统一使用 ranked_candidates 的字段，不再区分 scored / top_picks / candidates
-    all_codes = set()
-    for s in ranked:  # 所有候选股都纳入价格获取范围
-        if s.get('stock'):
-            all_codes.add(s.get('stock'))
-
-    # ── 价格获取：QXShare 单股查询(加后缀) → mx-data 兜底 → 无价格也行 ──
-    price_cache = {}
-    if all_codes:
-        codes = sorted(all_codes)
-        
-        def _add_suffix(code):
-            """自动加后缀"""
-            if code.startswith(("920", "8", "4")):
-                return f"{code}.BJ"
-            if code.startswith(('000','001','002','003','300','301')):
-                return f"{code}.SZ"
-            return f"{code}.SH"
-        
-        # ① QXShare HTTP API（单股查询，5s超时/只）
-        try:
-            import urllib.request, json as _json
-            def _qmt_get(code, timeout=5):
-                full = _add_suffix(code)
-                url = f"http://127.0.0.1:8080/market_data3?stock={full}&period=1d&count=2"
-                try:
-                    req = urllib.request.Request(url)
-                    with urllib.request.urlopen(req, timeout=timeout) as r:
-                        result = _json.loads(r.read().decode())
-                except Exception:
-                    return None
-                if not result or not result.get("success"):
-                    return None
-                close_data = result.get("data", {}).get("close", {})
-                dates = sorted(close_data.keys(), reverse=True)
-                if len(dates) < 2:
-                    return None
-                curr = close_data[dates[0]].get(full)
-                prev = close_data[dates[1]].get(full)
-                if curr and prev and float(prev) > 0:
-                    pct = (float(curr) - float(prev)) / float(prev) * 100
-                    return {"close": float(curr), "prev_close": float(prev), "pct": round(pct, 2)}
-                return None
-            
-            for code in codes[:50]:  # 最多50只
-                p = _qmt_get(code, timeout=5)
-                if p:
-                    price_cache[code] = p
-            logger.info(f"QXShare 价格获取: {len(price_cache)}/{min(len(codes),50)} 只")
-        except Exception as e:
-            logger.warning(f"QXShare 价格获取失败: {e}")
-        
-        # ② mx-data 兜底（仅补充 QXShare 未获取到的）
-        missing = [c for c in codes if c not in price_cache]
-        if missing:
-            try:
-                import os as _os
-                MXData = _load_mx_data_class()
-                api_key = _os.environ.get("MX_APIKEY") or _os.environ.get("MINIMAX_API_KEY", "")
-                tool = MXData(api_key=api_key)
-                for i in range(0, min(len(missing), 30), 10):
-                    batch = missing[i:i+10]
-                    query_str = " ".join([f"{c} 昨收价 涨跌幅" for c in batch])
-                    try:
-                        result = tool.query(query_str)
-                        tables, _, _, _ = tool.parse_result(result)
-                        for t in tables or []:
-                            for row in t.get("rows", []):
-                                code = row.get("代码", row.get("code", ""))
-                                if not code:
-                                    for k in row:
-                                        if any(x in str(k) for x in ["000","002","300","688","601","603"]):
-                                            code = k
-                                            break
-                                if code and code in missing and code not in price_cache:
-                                    close_str = row.get("昨收") or row.get("最新价") or ""
-                                    pct_str = row.get("涨跌幅") or "0"
-                                    try:
-                                        close = float(str(close_str).replace(",", "")) if close_str else None
-                                    except:
-                                        close = None
-                                    try:
-                                        pct = float(str(pct_str).replace("%", "").replace(",", "")) if pct_str else 0
-                                    except:
-                                        pct = 0
-                                    if close is not None:
-                                        price_cache[code] = {"close": close, "prev_close": close, "pct": pct}
-                    except Exception as e:
-                        logger.warning(f"mx-data 批量价格查询失败: {e}")
-                logger.info(f"mx-data 兜底完成: {len(missing)} 只中补充 {len([c for c in missing if c in price_cache])} 只")
-            except Exception as e:
-                logger.warning(f"mx-data 价格兜底失败: {e}")
-        
-        logger.info(f"价格获取完成: {len(price_cache)}/{min(len(codes),50)} 只")
+    # 卡片渲染严格只读工作流预先生成并落盘的快照，禁止在推送阶段访问行情或 LLM。
+    render_snapshot = phase2_result.get("report_render_snapshot") or {}
+    if render_snapshot.get("render_network_allowed") is True:
+        logger.warning("报告渲染快照错误地允许联网，已强制按只读模式处理")
+    price_cache = dict(render_snapshot.get("prices") or {})
+    logger.info(f"早报卡片只读渲染快照: 价格 {len(price_cache)} 只")
 
     # ── 解析7大分析师数据 ──
     sentiment_label = '未知'
     sentiment_color = 'grey'
     pe_info = ''
-    news_analyst_news = ''
+    news_analyst_news = str(render_snapshot.get("news_sentiment_summary") or "今日无重要舆情")
     limit_up = hot_sector = bulls_bears = None
 
     for r in phase1_results:
@@ -4059,8 +5001,7 @@ def _send_daily_report_card(phase1_results, phase2_result, backtest_selection, b
             if m_zt and limit_up is None:
                 limit_up = m_zt.group(1)
         elif name == '新闻分析师' and findings:
-            # 早报 v2：新闻舆情压成一句话，不再单列 15 条
-            news_analyst_news = _summarize_news_one_line(findings, max_len=300)
+            news_analyst_news = str(render_snapshot.get("news_sentiment_summary") or "今日无重要舆情")
 
     if '乐观' in sentiment_label or '偏多' in sentiment_label:
         sentiment_color = 'green'
@@ -4149,68 +5090,30 @@ def _send_daily_report_card(phase1_results, phase2_result, backtest_selection, b
 
         return "📊" + " | ".join(parts) if parts else ""
 
-    # ── 大盘数据解析（方向①）——直接查QMT HTTP（绕过mx-data次数限制）──
-    sh_chg = sz_chg = cy_chg = None
-    hs300_ret = None
-    total_turnover_str = None  # 两市总成交金额（万Y）
-    live_market_enabled = os.getenv("OPENCLAW_DISABLE_LIVE_MARKET") != "1"
-    try:
-        if live_market_enabled:
-            def _get_index_pct(code):
-                import urllib.request as _ur
-                url = f'http://127.0.0.1:8080/market_data3?stock={code}&period=1d&count=2'
-                req = _ur.Request(url)
-                with _ur.urlopen(req, timeout=5) as r:
-                    data = json.loads(r.read())
-                    close_data = data.get('data', {}).get('close', {})
-                    dates = sorted(close_data.keys(), reverse=True)
-                    if len(dates) >= 2:
-                        curr = close_data[dates[0]].get(code)
-                        prev = close_data[dates[1]].get(code)
-                        if curr and prev and float(prev) > 0:
-                            return (float(curr) - float(prev)) / float(prev) * 100
-                return None
-            sh_chg_raw  = _get_index_pct('000001.SH')
-            sz_chg_raw  = _get_index_pct('399001.SZ')
-            cy_chg_raw  = _get_index_pct('399006.SZ')
-            hs300_raw   = _get_index_pct('000300.SH')
-            if sh_chg_raw  is not None: sh_chg  = sh_chg_raw
-            if sz_chg_raw  is not None: sz_chg  = sz_chg_raw
-            if cy_chg_raw  is not None: cy_chg  = cy_chg_raw
-            if hs300_raw   is not None: hs300_ret = hs300_raw
-    except Exception:
-        pass
+    # 大盘与成交额均来自预生成快照；推送函数本身不做任何在线补取。
+    market_snapshot = render_snapshot.get("market") or {}
 
-    # ── 两市总成交金额（查 mx-data）──
-    try:
-        if live_market_enabled:
-            import subprocess as _sp
-            mx_script = Path(SKILLS_DIR) / "mx-data" / "mx_data.py"
-            if not mx_script.exists():
-                raise FileNotFoundError(f"mx_data.py not found: {mx_script}")
-            _mx_out = _sp.run(
-                [sys.executable, str(mx_script), '沪深A股今日总成交金额'],
-                capture_output=True, text=True, timeout=120,
-                env={**os.environ, 'MX_APIKEY': os.environ.get('MX_APIKEY', '')},
-            )
-            if _mx_out.returncode == 0:
-                import re as _re
-                m = _re.search(r'([\d.]+)\s*万亿', _mx_out.stdout)
-                if m:
-                    total_turnover_str = f"{m.group(1)}万亿"
-                else:
-                    import logging as _lg
-                    _lg.getLogger("daily_stock_workflow").warning(f"[大盘环境] mx-data 返回但正则不匹配: stdout tail={_mx_out.stdout[-200:]}")
-    except Exception as e:
-        import logging as _lg
-        _lg.getLogger("daily_stock_workflow").warning(f"[大盘环境] mx-data 子进程异常: {e}")
-        pass
+    def _optional_float(*keys):
+        for key in keys:
+            value = market_snapshot.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                return float(str(value).replace("%", "").replace(",", ""))
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    sh_chg = _optional_float("sh_pct", "sh_chg", "000001")
+    sz_chg = _optional_float("sz_pct", "sz_chg", "399001")
+    cy_chg = _optional_float("cy_pct", "cy_chg", "399006")
+    hs300_ret = _optional_float("hs300_pct", "hs300_ret", "000300")
+    total_turnover_str = market_snapshot.get("total_turnover") or market_snapshot.get("turnover")
 
     # ── 板块强弱解析（方向①）──
-    sector_source = phase1_results or phase2_result.get('all_analysts', [])
-    sector_rot = _extract_sector_rotation(sector_source, phase2_result, ranked)
-    if sector_rot.get("强势板块") or sector_rot.get("弱势板块"):
-        phase2_result["sector_rotation"] = sector_rot
+    sector_rot = render_snapshot.get("sector_rotation") or phase2_result.get("sector_rotation") or {}
+    if not (sector_rot.get("强势板块") or sector_rot.get("弱势板块")):
+        sector_rot = _extract_sector_rotation(phase1_results, phase2_result, ranked)
     hot_sectors_str = '、'.join(sector_rot.get("强势板块", [])[:3])
     cold_sectors_str = '、'.join(sector_rot.get("弱势板块", [])[:3])
 
@@ -4242,7 +5145,7 @@ def _send_daily_report_card(phase1_results, phase2_result, backtest_selection, b
         # 兑底在 max_len-2 截断
         return s[:max_len-2] + '..'
 
-    def _fmt_stock_row(s, label_emoji, position_pct=None):
+    def _fmt_stock_row(s, label_emoji):
         """从 final_decision 解析信号/理由，构建完整飞书行"""
         stock  = s.get('stock', '')
         name   = s.get('name', '')
@@ -4326,24 +5229,9 @@ def _send_daily_report_card(phase1_results, phase2_result, backtest_selection, b
         # ── 回测收益（方向④）──
         ret_str = _get_backtest_text(stock)
 
-        data_contract = s.get('data_contract') or {}
-        dq_flags = s.get('data_quality_flags') or []
-        if data_contract:
-            contract_parts = []
-            for label, key in [('K线', 'kline'), ('资金', 'money_flow'), ('财务', 'financial'), ('板块', 'sector')]:
-                item = data_contract.get(key) or {}
-                status = item.get('status') or 'unknown'
-                source = item.get('source') or 'none'
-                mark = 'OK' if status == 'ok' else '部分' if status == 'partial' else '缺失'
-                contract_parts.append(f"{label}{mark}:{source}")
-            data_quality_str = '数据: ' + ' '.join(contract_parts)
-        elif dq_flags:
-            data_quality_str = '数据缺口: ' + '、'.join(str(x) for x in dq_flags[:4])
-        else:
-            data_quality_str = '数据: 完整'
-
-        money_source = (s.get('money_flow') or {}).get('source')
-        money_source_str = f"资金流源:{money_source}" if money_source else ""
+        # 逐股卡片不展示底层数据源明细；缺口统一放在流程健康摘要。
+        data_quality_str = ''
+        money_source_str = ''
         pm_model = (s.get('decision_models') or {}).get('pm') or s.get('decision_source')
         pm_model_str = f"PM:{str(pm_model).split(':')[-1]}" if pm_model else ""
         evidence_validation = s.get('evidence_validation') or {}
@@ -4401,6 +5289,24 @@ def _send_daily_report_card(phase1_results, phase2_result, backtest_selection, b
         except (TypeError, ValueError):
             chase_penalty = 0.0
         edge_str = f"历史优势+{edge_score:.1f}" if edge_score > 0 else ''
+        knowledge_hits = s.get('knowledge_rule_hits') or []
+        try:
+            knowledge_adj = float(s.get('knowledge_rule_score_adjustment') or 0)
+        except (TypeError, ValueError):
+            knowledge_adj = 0.0
+        knowledge_str = f"知识规则{knowledge_adj:+.1f}" if knowledge_hits or abs(knowledge_adj) > 0.01 else ''
+        raw_signal = s.get('raw_signal_by_score') or ''
+        execution_gate = s.get('execution_gate') or ''
+        signal_blockers = s.get('signal_blockers') or []
+        entry_condition = str(s.get('entry_condition') or '').strip()
+        data_quality_score = s.get('data_quality_score')
+        gate_label = ''
+        if execution_gate == 'DIRECT_BUY_ALLOWED':
+            gate_label = '可直买'
+        elif execution_gate == 'INTRADAY_CONFIRMATION_REQUIRED':
+            gate_label = '盘中确认'
+        elif execution_gate == 'NO_BUY':
+            gate_label = '不买'
 
         # ── 置信度emoji（方向④）──
         conf_num = int(conf) if isinstance(conf, (int, float)) else 0
@@ -4418,12 +5324,14 @@ def _send_daily_report_card(phase1_results, phase2_result, backtest_selection, b
             f"做多{buy_score_label}",
             f"{conf_emoji_str}置信{conf_label}分",
         ]
-        if position_pct is not None:
-            overview_parts.append(f"仓位{position_pct}%")
         if pool_str:
             overview_parts.append(pool_str)
         if edge_str:
             overview_parts.append(edge_str)
+        if knowledge_str:
+            overview_parts.append(knowledge_str)
+        if gate_label:
+            overview_parts.append(gate_label)
         # 只在概览行超出 5 项时是"过长"，才不展示冗余字段
         if source_str:
             overview_parts.append(source_str)
@@ -4449,6 +5357,17 @@ def _send_daily_report_card(phase1_results, phase2_result, backtest_selection, b
             detail_parts.append(pm_model_str)
         if evidence_str:
             detail_parts.append(evidence_str)
+        if raw_signal and raw_signal != sig:
+            detail_parts.append(f"信号门控: 分数原始{raw_signal}->最终{sig}")
+        if signal_blockers:
+            detail_parts.append('阻断: ' + '；'.join(str(x) for x in signal_blockers[:3]))
+        if entry_condition:
+            detail_parts.append(f"盘中条件: {entry_condition}")
+        if data_quality_score not in (None, ''):
+            try:
+                detail_parts.append(f"数据质量{float(data_quality_score):.0f}分")
+            except (TypeError, ValueError):
+                pass
         if edge_matches:
             rule_texts = []
             for item in edge_matches[:2]:
@@ -4461,6 +5380,19 @@ def _send_daily_report_card(phase1_results, phase2_result, backtest_selection, b
                         rule_texts.append(str(desc))
             if rule_texts:
                 detail_parts.append('历史优势: ' + '；'.join(rule_texts))
+        if knowledge_hits:
+            kr_texts = []
+            for item in knowledge_hits[:3]:
+                if not isinstance(item, dict):
+                    continue
+                claim = str(item.get('claim') or item.get('rule_id') or '')
+                try:
+                    eff = float(item.get('effect') or 0)
+                    kr_texts.append(f"{claim}({eff:+.1f})")
+                except (TypeError, ValueError):
+                    kr_texts.append(claim)
+            if kr_texts:
+                detail_parts.append('知识规则: ' + '；'.join(kr_texts))
         quant_base = s.get('quant_base_score')
         risk_adj = s.get('llm_risk_adjustment')
         pool_dyn = s.get('pool_dynamic_adjustment')
@@ -4472,6 +5404,8 @@ def _send_daily_report_card(phase1_results, phase2_result, backtest_selection, b
                 if risk_adj not in (None, ''):
                     adj = float(risk_adj)
                     quant_text += f" + LLM修正{adj:+.1f}"
+                if knowledge_hits or abs(knowledge_adj) > 0.01:
+                    quant_text += f" + 知识规则{knowledge_adj:+.1f}"
                 if edge_score > 0:
                     quant_text += f" + 历史优势{edge_score:+.1f}"
                 if chase_penalty > 0:
@@ -4502,7 +5436,7 @@ def _send_daily_report_card(phase1_results, phase2_result, backtest_selection, b
     else:
         action_text = "今日空仓"
         action_emoji = '🔴'
-    rule_line = "盘中买入以Top5为池；Top5按做多分排序并叠加历史优势组合，WATCH需盘中技术确认"
+    rule_line = "盘中买入以Top5为池；按做多分选股，BUY可直买，WATCH需满足盘中条件"
     elements.append({
         "tag": "div",
         "text": {"tag": "lark_md",
@@ -4616,7 +5550,11 @@ def _send_daily_report_card(phase1_results, phase2_result, backtest_selection, b
     sel_valid = [x for x in sel_stocks if 'return_pct' in x and 'error' not in x]
     sel_no_trade = [x for x in sel_stocks if x.get('status') == 'no_trade']
     sel_days = sel.get('lookback_days', 5)
-    if sel_stocks:
+    if sel.get('status') == 'pending_forward_validation':
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "div", "text": {"tag": "lark_md",
+            "content": "📊 **候选质量**: 当前Top5待D+1/D+3/D+5/D+10前向验证，不使用未来数据倒推"}})
+    elif sel_stocks:
         elements.append({"tag": "hr"})
         sel_avg = sel.get('avg_return_pct', 0)
         sel_wr  = sel.get('win_rate', 0)
@@ -4652,7 +5590,15 @@ def _send_daily_report_card(phase1_results, phase2_result, backtest_selection, b
     strat_no_trade = [x for x in strat_trades if x.get('status') == 'no_trade']
     strat_data_missing = [x for x in strat_no_trade if x.get('reason_type') == 'data_missing']
     strat_not_filled = [x for x in strat_no_trade if x.get('reason_type') == 'not_filled']
-    if strat_trades:
+    if strat.get('status') == 'historical_forward_validation':
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "div", "text": {"tag": "lark_md",
+            "content": f"📈 **历史前向验证**\n{strat.get('summary', '当前Top5待验证')}"}})
+    elif strat.get('status') == 'insufficient_forward_samples':
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "div", "text": {"tag": "lark_md",
+            "content": "📈 **历史前向验证**: 样本不足，当前Top5待后续复盘验证"}})
+    elif strat_trades:
         elements.append({"tag": "hr"})
         strat_avg = strat.get('avg_return_pct', 0)
         strat_window = ""
@@ -4730,154 +5676,123 @@ def _send_daily_report_card(phase1_results, phase2_result, backtest_selection, b
 
 
 
-    # ── ⑥ Top5 股票（#5 两段式：概览行 + 详情，全部以 div 呈现避免飞书 webhook 拒绝 details）───
+    # ── ⑥ Top5 股票：每只独立区块，字段完整且不使用省略号 ──
     if combined_top5:
         elements.append({"tag": "hr"})
-        overview_lines = []
-        detail_lines = []
-        for s in combined_top5:
+        top5_policy = phase2_result.get("top5_policy") or {}
+        chase_limit = top5_policy.get("high_chase_limit")
+        policy_text = ""
+        if chase_limit is not None:
+            policy_text = f" | 高追涨候选上限 {chase_limit}只"
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": f"🎯 **Top 5**{policy_text}"},
+        })
+        for display_rank, s in enumerate(combined_top5, 1):
             sig = _parse_signal(s)
             emoji = '🟢' if sig == 'BUY' else '🟡'
-            row = _fmt_stock_row(s, emoji)
-            overview_lines.append(row['overview'])
-            detail_lines.append(f"- **{s.get('stock', '')} {s.get('name', '')}**: {row['detail']}")
-        elements.append({
-            "tag": "div",
-            "text": {"tag": "lark_md",
-                   "content": '🎯 **Top 5**\n' + '\n'.join(overview_lines)}
-        })
-        if detail_lines:
-            # 早报 v2：webhook 机器人不支持 details，改用普通 div 展示
+            stock = str(s.get("stock") or "")
+            name = str(s.get("name") or "")
+            final_score = _buy_score_value(s)
+            reliability = _confidence_value(s)
+            global_rank = s.get("global_rank") or "?"
+            pm_signal = str(s.get("pm_signal") or s.get("llm_signal") or sig)
+            selection_reason = str(s.get("top5_selection_reason") or "按最终做多分与数据门控入选")
+            final_reason = str(s.get("final_reason") or s.get("reason") or "未记录")
+            entry_condition = str(s.get("entry_condition") or "无盘中买入条件")
+            gate = str(s.get("execution_gate") or "")
+            gate_text = {
+                "DIRECT_BUY_ALLOWED": "允许直接买入",
+                "INTRADAY_CONFIRMATION_REQUIRED": "需盘中确认",
+                "NO_BUY": "不允许买入",
+            }.get(gate, gate or "未记录")
+            tv_url = _tradingview_chart_url(stock)
+            tv_line = f"\n[TradingView 图表]({tv_url})" if tv_url else ""
+            score_text = f"{final_score:.1f}".rstrip("0").rstrip(".")
+            reliability_text = f"{reliability:.1f}".rstrip("0").rstrip(".")
+            transition = f"基金经理 {pm_signal} → 最终 {sig}" if pm_signal != sig else f"基金经理与最终信号均为 {sig}"
+            content = (
+                f"{emoji} **Top{display_rank}  {stock} {name}**\n"
+                f"最终信号: **{sig}** | 做多分: **{score_text}** | 判断可靠度: **{reliability_text}**\n"
+                f"全局排名: **#{global_rank}/{len(ranked)}** | {transition}\n"
+                f"入选原因: {selection_reason}\n"
+                f"最终理由: {final_reason}\n"
+                f"执行门槛: {gate_text} | 盘中条件: {entry_condition}"
+                f"{tv_line}"
+            )
             elements.append({
                 "tag": "div",
-                "text": {"tag": "lark_md",
-                       "content": '🔍 **Top5 详情**\n' + '\n'.join(detail_lines)}
+                "text": {"tag": "lark_md", "content": content},
             })
 
-    # ── ⑦ 数据质量 + 执行信息（方向⑥：时间戳）───
-    qual_parts = []
-    if pe_info:
-        qual_parts.append(pe_info)
-    total_count = len(ranked)  # 早报 v2 修复：提到 if data_quality 之外
-    # 早报 v2 修复：dq 相关变量在 if 块外默认初始化，避免 data_quality 为空时挂
-    qpe = qrsi = ''
-    dq_summary = {}
-    flag_counts = core_counts = aux_counts = {}
-    affected_count = 0
-    flag_names = {}
-    if data_quality:
-        qpe = data_quality.get('pe', '')
-        qrsi = data_quality.get('rsi', '')
-        dq_summary = data_quality.get('summary') or phase2_result.get('data_quality_summary') or {}
-        flag_counts = dq_summary.get('flag_counts') or {}
-        core_counts = dq_summary.get('core_flag_counts') or {}
-        aux_counts = dq_summary.get('aux_flag_counts') or {}
-        affected_count = dq_summary.get('affected_count', 0)
-        total_count = len(ranked)
-        if flag_counts:
-            flag_names = {
-                'KLINE_MISSING': 'K线缺失',
-                'KLINE_SHORT': 'K线偏短',
-                'FINANCIAL_MISSING': '财务缺失',
-                'SECTOR_MISSING': '板块缺失',
-                'MONEY_FLOW_MISSING': '资金流缺失',
-                'MONEY_FLOW_FETCH_FAILED': '资金流抓取失败',
-                'MONEY_FLOW_PARTIAL': '资金流部分缺失',
-                'TECH_ANALYSIS_MISSING': '技术形态分析缺失',
-                'MODEL_FAILED': '模型裁决失败',
-                'MODEL_EVIDENCE_FAILED': '模型证据校验失败',
-            }
-            if not core_counts and not aux_counts:
-                core_keys = {
-                    'KLINE_MISSING', 'KLINE_SHORT', 'FINANCIAL_MISSING',
-                    'MONEY_FLOW_MISSING', 'MONEY_FLOW_FETCH_FAILED', 'TECH_ANALYSIS_MISSING', 'MODEL_FAILED',
-                }
-                aux_keys = {'MONEY_FLOW_PARTIAL', 'SECTOR_MISSING'}
-                core_counts = {k: v for k, v in flag_counts.items() if k in core_keys}
-                aux_counts = {k: v for k, v in flag_counts.items() if k in aux_keys}
-        source_counts = dq_summary.get('money_flow_source_counts') or {}
-        if source_counts:
-            src_line = '/'.join(f"{k}:{v}" for k, v in sorted(source_counts.items()))
-            qual_parts.append(f"资金流来源 {src_line}")
-        elif total_count:
-            qual_parts.append(f"数据质量: 未发现关键缺口({total_count}只)")
-        if qpe:
-            qual_parts.append(f"PE覆盖{qpe}")
-        if qrsi:
-            qual_parts.append(f"RSI有效{qrsi}")
-    exec_parts = []
-    if exec_stats:
-        exec_parts.append(f"共{exec_stats.get('total', 0)}只辩论")
-        if exec_stats.get('model'):
-            exec_parts.append(f"🤖 {exec_stats.get('model', '')}")
-        source_counts = exec_stats.get('decision_sources') or {}
-        if source_counts:
-            exec_parts.append('裁决来源 ' + '/'.join(f"{k}:{v}" for k, v in sorted(source_counts.items())))
-    checkpoint_summary = phase2_result.get('checkpoint_summary') or {}
-    if checkpoint_summary:
-        exec_parts.append(
-            f"断点 已完成{checkpoint_summary.get('completed', 0)} "
-            f"失败{checkpoint_summary.get('failed', 0)} "
-            f"节点{checkpoint_summary.get('node_status', 0)}"
+    # ── ⑦ 流程健康摘要：核心、辅助、时效分别说明 ──
+    total_count = len(ranked)
+    dq_summary = (
+        (data_quality or {}).get("summary")
+        or phase2_result.get("data_quality_summary")
+        or (phase2_result.get("workflow_health_summary") or {}).get("data_quality")
+        or {}
+    )
+    core_counts = dq_summary.get("core_flag_counts") or {}
+    aux_counts = dq_summary.get("aux_flag_counts") or {}
+    freshness_counts = dq_summary.get("freshness_flag_counts") or {}
+    flag_names = {
+        "KLINE_MISSING": "K线缺失",
+        "KLINE_SHORT": "K线偏短",
+        "MONEY_FLOW_MISSING": "核心资金流缺失",
+        "MONEY_FLOW_FETCH_FAILED": "资金流抓取失败",
+        "MONEY_FLOW_PARTIAL": "资金流核心字段不全",
+        "MONEY_FLOW_DDX_MISSING": "DDX缺失",
+        "MONEY_FLOW_DDY_MISSING": "DDY缺失",
+        "FINANCIAL_MISSING": "财务缺失",
+        "FINANCIAL_DATE_UNKNOWN": "财务日期未知",
+        "SECTOR_MISSING": "板块缺失",
+        "NEWS_NO_RECENT_ITEMS": "近期新闻为空",
+        "TECH_ANALYSIS_MISSING": "技术形态缺失",
+        "MODEL_FAILED": "模型裁决失败",
+        "MODEL_EVIDENCE_FAILED": "证据校验失败",
+        "KLINE_DATE_UNKNOWN": "K线日期未知",
+        "MONEY_FLOW_DATE_UNKNOWN": "资金流日期未知",
+        "SECTOR_DATE_UNKNOWN": "板块日期未知",
+        "NEWS_DATE_UNKNOWN": "新闻日期未知",
+        "KLINE_STALE": "K线过期",
+        "MONEY_FLOW_STALE": "资金流过期",
+        "FINANCIAL_STALE": "财务过期",
+        "SECTOR_STALE": "板块过期",
+        "NEWS_STALE": "新闻检查过期",
+    }
+
+    def _format_flag_counts(counts):
+        return "、".join(f"{flag_names.get(key, key)} {value}只" for key, value in sorted((counts or {}).items()))
+
+    core_complete = dq_summary.get("core_complete_count", max(0, total_count - int(dq_summary.get("core_affected_count") or 0)))
+    money_core_complete = dq_summary.get("money_flow_core_complete_count")
+    money_aux_complete = dq_summary.get("money_flow_aux_complete_count")
+    health_lines = [f"核心数据完整: **{core_complete}/{total_count}只**"]
+    if core_counts:
+        health_lines.append("核心缺口: " + _format_flag_counts(core_counts))
+    else:
+        health_lines.append("核心缺口: 无")
+    if money_core_complete is not None or money_aux_complete is not None:
+        health_lines.append(
+            f"资金流: 核心完整 **{money_core_complete if money_core_complete is not None else '?'}"
+            f"/{total_count}只**，DDX/DDY完整 **{money_aux_complete if money_aux_complete is not None else '?'}"
+            f"/{total_count}只**"
         )
-    contract_counts = dq_summary.get('data_contract_counts') or {}
-    if contract_counts:
-        contract_line = []
-        for key, label in [('kline', 'K线'), ('money_flow', '资金'), ('financial', '财务'), ('sector', '板块')]:
-            counts = contract_counts.get(key) or {}
-            ok = counts.get('ok', 0)
-            partial = counts.get('partial', 0)
-            missing = counts.get('missing', 0)
-            if ok or partial or missing:
-                contract_line.append(f"{label}OK{ok}/部分{partial}/缺{missing}")
-        if contract_line:
-            qual_parts.append('数据合同 ' + ' '.join(contract_line))
-    exec_parts.append(route_tag)
-    qual_line = ' | '.join(qual_parts) if qual_parts else ''
-    exec_line = ' | '.join(exec_parts)
-
-    # ── #11 数据质量综合分（0-100，分越高越完整）───
-    dq_score = None
-    dq_detail = []
-    if total_count and (core_counts or aux_counts):
-        # 权重调为更温和：关键缺口 -1/只, 辅助 -0.3/只, 模型失败 -2/只
-        # 这样 73 只，50 只资金流缺失只扣 50 分，最后 50/100，能反映问题但不归零
-        core_penalty = sum(core_counts.values()) * 1.0
-        aux_penalty = sum(aux_counts.values()) * 0.3
-        model_penalty = core_counts.get('MODEL_FAILED', 0) * 2.0
-        total_penalty = core_penalty + aux_penalty + model_penalty
-        dq_score = max(0, int(100 - total_penalty))
-        if dq_score >= 90:
-            dq_grade, dq_color = '优秀', '🟢'
-        elif dq_score >= 75:
-            dq_grade, dq_color = '良好', '🟡'
-        elif dq_score >= 60:
-            dq_grade, dq_color = '一般', '🟠'
-        else:
-            dq_grade, dq_color = '较差', '🔴'
-        dq_detail.append(f"{dq_color} 数据完整度 **{dq_score}/100** ({dq_grade})")
-        if core_counts:
-            core_line = '、'.join(f"{flag_names.get(k, k)}{v}" for k, v in sorted(core_counts.items()))
-            dq_detail.append(f"关键缺口{affected_count}/{total_count}: {core_line}")
-        if aux_counts:
-            aux_line = '、'.join(f"{flag_names.get(k, k)}{v}" for k, v in sorted(aux_counts.items()))
-            dq_detail.append(f"辅助缺口: {aux_line}")
-
-    # ── #17 早报质量自评（耗时 + 模型 + 数据完整度）───
-    report_elapsed = (datetime.datetime.now() - _run_start_time).total_seconds() if _run_start_time else None
-    quality_parts = dq_detail if dq_detail else (['数据质量: 未发现关键缺口'] if total_count else [])
-    if report_elapsed is not None:
-        elapsed_str = f"{int(report_elapsed//60)}分{int(report_elapsed%60)}秒"
-        quality_parts.append(f"⏱ 耗时 {elapsed_str}")
-    quality_line = ' | '.join(quality_parts) if quality_parts else ''
-    exec_line_text = f"⚙️ {exec_line}" if exec_line else ''
-
-    if quality_line:
-        elements.append({"tag": "hr"})
-        elements.append({
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": f"📊 {quality_line}\n{exec_line_text}"}
-        })
+    health_lines.append("辅助缺口: " + (_format_flag_counts(aux_counts) if aux_counts else "无"))
+    health_lines.append("时效异常: " + (_format_flag_counts(freshness_counts) if freshness_counts else "无"))
+    source_counts = dq_summary.get("money_flow_source_counts") or {}
+    if source_counts:
+        health_lines.append("资金流来源: " + "、".join(f"{key} {value}只" for key, value in sorted(source_counts.items())))
+    model_stats = exec_stats or (phase2_result.get("workflow_health_summary") or {}).get("model_execution") or {}
+    model_line = str(model_stats.get("model") or "模型明细未记录")
+    health_lines.append("模型覆盖: " + model_line)
+    health_lines.append(f"运行路径: {route_tag}")
+    elements.append({"tag": "hr"})
+    elements.append({
+        "tag": "div",
+        "text": {"tag": "lark_md", "content": "📊 **本次流程健康摘要**\n" + "\n".join(health_lines)},
+    })
 
     card = {
         "config": {"enable_forward": True},
@@ -4904,7 +5819,7 @@ def _send_daily_report_card(phase1_results, phase2_result, backtest_selection, b
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="每日选股工作流")
-    parser.add_argument("--model", default=None, help="LLM 模型（默认火山引擎 coding plan，GPT-5.5 / MiniMax M3 兜底）")
+    parser.add_argument("--model", default=None, help="LLM 模型（默认火山引擎 coding plan，GPT-5.6 Sol / MiniMax M3 兜底）")
     parser.add_argument("--resume", action="store_true", help="从上次断点继续辩论（不重新跑 Step 1-3）")
     args = parser.parse_args()
     model = args.model or "volcengine-plan/ark-code-latest"
